@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""
+nginx-autoblock — behavioral subnet autoblocker for Nginx.
+
+Detects bot crawlers by composite scoring across multiple signals
+(UA diversity, request patterns, IP reputation) and adds offending
+subnets to nginx's blocklist with TTL.
+
+Designed for CDN-fronted sites (Cloudflare et al.) — does NOT use
+static-asset ratio as a signal because CDN edge-caches static
+content, making this signal useless at origin.
+
+Usage:
+    autoblock                    # production run (intended for cron)
+    autoblock --dry-run          # report candidates without writing
+    autoblock --show-scores      # diagnostic: top-30 subnets with scores
+    autoblock --cleanup          # remove expired auto-bans
+    autoblock --config PATH      # alternative config file
+
+Default config path: /etc/nginx-autoblock/config.env
+"""
+
+import argparse
+import bisect
+import gzip
+import ipaddress
+import json
+import logging
+import re
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────
+# Defaults — override via /etc/nginx-autoblock/config.env
+
+DEFAULTS = {
+    # Paths
+    "access_log":       "/var/log/nginx/access.log",
+    "blocked_conf":     "/etc/nginx/blocked-subnets.conf",
+    "whitelist":        "/etc/nginx/autoblock-whitelist.conf",
+    "asn_db":           "/var/lib/nginx-autoblock/ip2asn-combined.tsv.gz",
+    "rep_cache":        "/var/cache/nginx-autoblock/reputation.json",
+    "log_file":         "/var/log/nginx-autoblock.log",
+    # Detection
+    "window_minutes":   30,
+    "min_requests":     200,
+    "score_threshold":  7,
+    "ttl_days":         7,
+    "rep_cache_ttl_days": 7,
+    "ipv6_prefix":      64,
+    # Target path patterns — comma-separated, prefix match.
+    # A request counts toward the "API ratio" signal if it starts with any
+    # of these prefixes. Default targets API + search pages.
+    "target_paths":     "/api/,/search",
+    # Excluded paths — checked BEFORE target_paths.
+    # Use this for legitimate admin/internal traffic that hits target_paths
+    # but should NOT count toward the bot signal.
+    "excluded_paths":   "/api/admin/",
+    # ip-api.com enrichment (free, no key, 45 batch req/min)
+    "use_ipapi":        "true",
+    "ipapi_batch_url":  "http://ip-api.com/batch?fields=query,proxy,hosting,mobile,isp,as,country",
+    "ipapi_timeout":    10,
+    "ipapi_batch_size": 100,
+}
+
+DEFAULT_CONFIG_PATH = "/etc/nginx-autoblock/config.env"
+
+
+def load_config(path):
+    cfg = dict(DEFAULTS)
+    if not path or not Path(path).exists():
+        return cfg
+    for raw in Path(path).read_text().splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k = k.strip().lower()
+        v = v.strip().strip('"\'')
+        if k in cfg:
+            cfg[k] = v
+    # Coerce types
+    cfg["window_minutes"]      = int(cfg["window_minutes"])
+    cfg["min_requests"]        = int(cfg["min_requests"])
+    cfg["score_threshold"]     = int(cfg["score_threshold"])
+    cfg["ttl_days"]            = int(cfg["ttl_days"])
+    cfg["rep_cache_ttl_days"]  = int(cfg["rep_cache_ttl_days"])
+    cfg["ipv6_prefix"]         = int(cfg["ipv6_prefix"])
+    cfg["ipapi_timeout"]       = int(cfg["ipapi_timeout"])
+    cfg["ipapi_batch_size"]    = int(cfg["ipapi_batch_size"])
+    cfg["use_ipapi"]           = str(cfg["use_ipapi"]).lower() in ("true", "1", "yes", "on")
+    cfg["target_paths"]   = [p.strip() for p in cfg["target_paths"].split(",") if p.strip()]
+    cfg["excluded_paths"] = [p.strip() for p in cfg["excluded_paths"].split(",") if p.strip()]
+    return cfg
+
+
+# ─────────────────────────────────────────────────────────────────
+# Hosting/datacenter ASN keywords — fallback when ip-api is unavailable
+# ASN description (from iptoasn.com TSV) is matched against these substrings
+# (case-insensitive). Hits mean the subnet sits on hosting/datacenter infra.
+
+HOSTING_KEYWORDS = [
+    "hosting", "cloud", "vps", "dedicated", "datacenter", "data center",
+    "colocation", "server farm",
+    # Major cloud providers
+    "amazon", "aws", "google cloud", "google llc", "microsoft azure",
+    "digital ocean", "digitalocean", "linode", "vultr", "ovh", "hetzner",
+    "leaseweb", "netcup", "contabo", "choopa", "stark industries",
+    # Chinese hosting / CDN
+    "baidu", "alibaba", "tencent", "huawei cloud", "sinnet", "ucloud", "kingsoft",
+    # Russian / CIS hosting
+    "selectel", "beget", "firstbyte", "mts cloud",
+    # Other
+    "m247", "hurricane electric", "datapacket", "wp engine", "rackspace",
+    "fastly", "stackpath", "psychz",
+]
+
+LOG_RE = re.compile(
+    r'^(\S+) - - \[([^\]]+)\] "(\S+) (\S+) (\S+)" (\d+) \S+ "([^"]*)" "([^"]*)"'
+)
+AUTO_RE = re.compile(
+    r"^(\S+) 1; # auto added=(\S+) expires=(\S+) reason=(.+)$"
+)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Whitelist / ASN keyword fallback
+
+def load_whitelist(path):
+    nets = []
+    if not Path(path).exists():
+        return nets
+    for line in Path(path).read_text().splitlines():
+        s = line.split("#", 1)[0].strip()
+        if not s:
+            continue
+        try:
+            nets.append(ipaddress.ip_network(s, strict=False))
+        except ValueError:
+            logging.warning("bad whitelist CIDR: %s", s)
+    return nets
+
+
+def is_whitelisted(net, whitelist):
+    for w in whitelist:
+        if net.overlaps(w):
+            return True
+    return False
+
+
+def load_asn_db(path):
+    """Load iptoasn-combined.tsv.gz. Returns sorted ranges for bisect lookup."""
+    p = Path(path)
+    if not p.exists():
+        return None
+    starts4, ends4, descs4 = [], [], []
+    starts6, ends6, descs6 = [], [], []
+    with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) != 5:
+                continue
+            start_ip, end_ip, _asn, _cc, desc = parts
+            try:
+                s_int = int(ipaddress.ip_address(start_ip))
+                e_int = int(ipaddress.ip_address(end_ip))
+            except ValueError:
+                continue
+            if ":" in start_ip:
+                starts6.append(s_int); ends6.append(e_int); descs6.append(desc)
+            else:
+                starts4.append(s_int); ends4.append(e_int); descs4.append(desc)
+    return (starts4, ends4, descs4, starts6, ends6, descs6)
+
+
+def asn_lookup(net, db):
+    if db is None:
+        return None
+    starts4, ends4, descs4, starts6, ends6, descs6 = db
+    ip_int = int(net.network_address)
+    if isinstance(net, ipaddress.IPv4Network):
+        starts, ends, descs = starts4, ends4, descs4
+    else:
+        starts, ends, descs = starts6, ends6, descs6
+    idx = bisect.bisect_right(starts, ip_int) - 1
+    if 0 <= idx < len(starts) and starts[idx] <= ip_int <= ends[idx]:
+        return descs[idx]
+    return None
+
+
+def is_hosting_asn(desc):
+    if not desc:
+        return False
+    d = desc.lower()
+    return any(kw in d for kw in HOSTING_KEYWORDS)
+
+
+# ─────────────────────────────────────────────────────────────────
+# IP reputation cache + ip-api.com batch
+
+def load_rep_cache(path):
+    p = Path(path)
+    if not p.exists():
+        return {}
+    try:
+        return json.loads(p.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        logging.warning("reputation cache unreadable, starting fresh: %s", e)
+        return {}
+
+
+def save_rep_cache(path, cache):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = p.with_suffix(".tmp")
+    tmp.write_text(json.dumps(cache, indent=2, sort_keys=True))
+    tmp.rename(p)
+
+
+def query_ipapi_batch(ips, cfg):
+    """POST batch query to ip-api.com. Returns {ip: {hosting, proxy, ...}} or {}."""
+    if not ips:
+        return {}
+    payload = json.dumps([{"query": ip} for ip in ips]).encode()
+    req = urllib.request.Request(
+        cfg["ipapi_batch_url"],
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=cfg["ipapi_timeout"]) as resp:
+            data = json.loads(resp.read())
+    except (urllib.error.URLError, ValueError, OSError) as e:
+        logging.warning("ip-api batch failed for %d IPs: %s", len(ips), e)
+        return {}
+    results = {}
+    for item in data:
+        ip = item.get("query", "")
+        if not ip:
+            continue
+        results[ip] = {
+            "hosting": bool(item.get("hosting")),
+            "proxy":   bool(item.get("proxy")),
+            "mobile":  bool(item.get("mobile")),
+            "isp":     item.get("isp", ""),
+            "country": item.get("country", ""),
+            "as":      item.get("as", ""),
+        }
+    return results
+
+
+def enrich_with_reputation(candidates_with_stats, cache, cfg):
+    """
+    For each (subnet, stats) ensures cache has fresh ip-api data.
+    Sample IP is taken from observed log entries (NOT network address)
+    because .0 addresses can have different classification than active hosts.
+    """
+    if not cfg["use_ipapi"]:
+        return {}
+    now = int(time.time())
+    ttl = cfg["rep_cache_ttl_days"] * 86400
+    result = {}
+    need_query = []  # list of (cidr_str, sample_ip)
+
+    for net, s in candidates_with_stats:
+        cidr = str(net)
+        entry = cache.get(cidr)
+        if entry and "ipapi" in entry and (now - entry.get("queried_at", 0)) < ttl:
+            result[cidr] = entry["ipapi"]
+            continue
+        ips_in_log = s.get("ips") if s else None
+        sample_ip = next(iter(ips_in_log)) if ips_in_log else str(net.network_address)
+        need_query.append((cidr, sample_ip))
+
+    batch_size = cfg["ipapi_batch_size"]
+    for start in range(0, len(need_query), batch_size):
+        chunk = need_query[start:start + batch_size]
+        ips = [s for _, s in chunk]
+        batch_results = query_ipapi_batch(ips, cfg)
+        for cidr, sample_ip in chunk:
+            ipapi_data = batch_results.get(sample_ip)
+            if ipapi_data is None:
+                continue
+            cache[cidr] = {
+                "queried_at": now,
+                "sample_ip":  sample_ip,
+                "ipapi":      ipapi_data,
+            }
+            result[cidr] = ipapi_data
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────
+# Log scanning
+
+def subnet_for(ip_str, ipv6_prefix):
+    ip = ipaddress.ip_address(ip_str)
+    prefix = 24 if isinstance(ip, ipaddress.IPv4Address) else ipv6_prefix
+    return ipaddress.ip_network(f"{ip}/{prefix}", strict=False)
+
+
+def is_target_path(path, target_paths, excluded_paths):
+    """True if path matches target_paths AND not excluded_paths."""
+    for ex in excluded_paths:
+        if path.startswith(ex):
+            return False
+    for t in target_paths:
+        if path.startswith(t) or t in path:
+            return True
+    return False
+
+
+def normalize_path(path):
+    """Drop query string for path concentration grouping."""
+    return path.split("?", 1)[0]
+
+
+def scan_log(window_start, cfg):
+    stats = defaultdict(lambda: {
+        "requests":     0,
+        "uas":          Counter(),
+        "ips":          set(),
+        "target":       0,
+        "with_referer": 0,
+        "paths":        Counter(),
+    })
+    p = Path(cfg["access_log"])
+    if not p.exists():
+        logging.error("access log not found: %s", p)
+        return stats
+    with p.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = LOG_RE.match(line)
+            if not m:
+                continue
+            ip, ts_str, _method, path, _proto, _status, referer, ua = m.groups()
+            try:
+                ts = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S %z")
+            except ValueError:
+                continue
+            if ts < window_start:
+                continue
+            try:
+                net = subnet_for(ip, cfg["ipv6_prefix"])
+            except ValueError:
+                continue
+            s = stats[net]
+            s["requests"] += 1
+            s["uas"][ua] += 1
+            s["ips"].add(ip)
+            if is_target_path(path, cfg["target_paths"], cfg["excluded_paths"]):
+                s["target"] += 1
+            if referer and referer != "-":
+                s["with_referer"] += 1
+            s["paths"][normalize_path(path)] += 1
+    return stats
+
+
+# ─────────────────────────────────────────────────────────────────
+# Scoring (max 11)
+
+def score(s, asn_desc, ipapi):
+    """
+    Composite bot signal score. Signals:
+    - UA diversity ≤ 2:           +2  (homogeneous bot farm signature)
+    - Target paths ≥ 50% / ≥ 80%: +1 / +1 additional
+    - Top-3 paths ≥ 50% / ≥ 80%:  +1 / +1 additional  (low URL diversity)
+    - Referer rate < 30% / < 10%: +1 / +1 additional  (real browsers send referer)
+    - ip-api hosting OR proxy:    +3  (datacenter/proxy = strong bot signal)
+        - falls back to ASN keyword match if ip-api unavailable
+    - ip-api mobile=true:         -1  (mobile carrier = likely real users)
+    """
+    pts = 0
+    parts = []
+    n = s["requests"]
+
+    if len(s["uas"]) <= 2:
+        pts += 2; parts.append(f"ua{len(s['uas'])}")
+
+    target_ratio = s["target"] / n
+    if target_ratio >= 0.5:
+        pts += 1; parts.append(f"tgt{int(target_ratio*100)}%")
+    if target_ratio >= 0.8:
+        pts += 1; parts.append("tgt+")
+
+    top3 = sum(c for _, c in s["paths"].most_common(3))
+    top3_ratio = top3 / n
+    if top3_ratio >= 0.5:
+        pts += 1; parts.append(f"top3_{int(top3_ratio*100)}%")
+    if top3_ratio >= 0.8:
+        pts += 1; parts.append("top3+")
+
+    referer_ratio = s["with_referer"] / n
+    if referer_ratio < 0.30:
+        pts += 1; parts.append(f"ref{int(referer_ratio*100)}%")
+    if referer_ratio < 0.10:
+        pts += 1; parts.append("ref+")
+
+    if ipapi is not None:
+        tags = []
+        if ipapi.get("hosting"): tags.append("host")
+        if ipapi.get("proxy"):   tags.append("proxy")
+        if tags:
+            pts += 3
+            parts.append("ipapi:" + "+".join(tags))
+        elif ipapi.get("mobile"):
+            pts -= 1
+            parts.append("mobile-1")
+    elif is_hosting_asn(asn_desc):
+        # Fallback when ip-api unavailable
+        pts += 3
+        parts.append("asn:" + (asn_desc or "")[:25].replace(" ", "_"))
+
+    return pts, " ".join(parts)
+
+
+def evaluate(stats, whitelist, asn_db, rep_cache, cfg):
+    candidates_pre = []
+    for net, s in stats.items():
+        if s["requests"] < cfg["min_requests"]:
+            continue
+        if is_whitelisted(net, whitelist):
+            continue
+        candidates_pre.append((net, s))
+
+    reputations = enrich_with_reputation(candidates_pre, rep_cache, cfg)
+
+    out = []
+    for net, s in candidates_pre:
+        asn_desc = asn_lookup(net, asn_db)
+        ipapi = reputations.get(str(net))
+        pts, reasons = score(s, asn_desc, ipapi)
+        if pts >= cfg["score_threshold"]:
+            out.append((net, pts, reasons, s["requests"]))
+    return out
+
+
+def all_scored(stats, whitelist, asn_db, rep_cache, cfg, limit=30):
+    candidates_pre = [(net, s) for net, s in stats.items()
+                      if s["requests"] >= cfg["min_requests"]]
+    reputations = enrich_with_reputation(candidates_pre, rep_cache, cfg)
+    rows = []
+    for net, s in candidates_pre:
+        wl = is_whitelisted(net, whitelist)
+        asn_desc = asn_lookup(net, asn_db)
+        ipapi = reputations.get(str(net))
+        pts, reasons = score(s, asn_desc, ipapi)
+        rows.append((pts, net, s["requests"], reasons, wl, s, asn_desc, ipapi))
+    rows.sort(key=lambda x: (-x[0], -x[2]))
+    return rows[:limit]
+
+
+# ─────────────────────────────────────────────────────────────────
+# Blocked file management
+
+def read_blocked(path):
+    manual, auto = [], []
+    p = Path(path)
+    if not p.exists():
+        return manual, auto
+    for line in p.read_text().splitlines():
+        if not line.strip() or line.lstrip().startswith("#"):
+            manual.append(line)
+            continue
+        m = AUTO_RE.match(line)
+        if m:
+            cidr, added, expires, reason = m.groups()
+            auto.append({"cidr": cidr, "added": added, "expires": expires, "reason": reason})
+        else:
+            manual.append(line)
+    return manual, auto
+
+
+def write_blocked(path, manual, auto):
+    out = list(manual)
+    if auto:
+        if out and out[-1].strip():
+            out.append("")
+        out.append("# Auto-added by nginx-autoblock — DO NOT EDIT manually")
+        out.append("# To unblock: remove the line + sudo nginx -s reload")
+        for e in sorted(auto, key=lambda x: x["added"]):
+            out.append(
+                f"{e['cidr']} 1; # auto added={e['added']} "
+                f"expires={e['expires']} reason={e['reason']}"
+            )
+    Path(path).write_text("\n".join(out) + "\n")
+
+
+def nginx_reload():
+    test = subprocess.run(["nginx", "-t"], capture_output=True, text=True)
+    if test.returncode != 0:
+        logging.error("nginx -t failed: %s", test.stderr.strip())
+        return False
+    rel = subprocess.run(["nginx", "-s", "reload"], capture_output=True, text=True)
+    if rel.returncode != 0:
+        logging.error("nginx reload failed: %s", rel.stderr.strip())
+        return False
+    return True
+
+
+def manual_cidrs(manual_lines):
+    out = set()
+    for line in manual_lines:
+        m = re.match(r"^\s*(\S+) 1;", line)
+        if m and not line.lstrip().startswith("#"):
+            out.add(m.group(1))
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# Commands
+
+def cmd_run(cfg, dry_run=False):
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=cfg["window_minutes"])
+    whitelist = load_whitelist(cfg["whitelist"])
+    asn_db = load_asn_db(cfg["asn_db"])
+    rep_cache = load_rep_cache(cfg["rep_cache"])
+    stats = scan_log(window_start, cfg)
+    candidates = evaluate(stats, whitelist, asn_db, rep_cache, cfg)
+
+    save_rep_cache(cfg["rep_cache"], rep_cache)
+
+    if not candidates:
+        logging.info("scan: %d subnets in window, 0 candidates (threshold=%d)",
+                     len(stats), cfg["score_threshold"])
+        return
+
+    manual, auto = read_blocked(cfg["blocked_conf"])
+    manual_set = manual_cidrs(manual)
+    auto_by_cidr = {e["cidr"]: e for e in auto}
+
+    new_expires = (now + timedelta(days=cfg["ttl_days"])).strftime("%Y-%m-%dT%H:%M:%SZ")
+    now_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    added, extended = [], []
+    for net, pts, reasons, n in candidates:
+        cidr = str(net)
+        full_reason = f"score{pts}/11 {n}req {reasons}"
+        if cidr in manual_set:
+            continue
+        if cidr in auto_by_cidr:
+            auto_by_cidr[cidr]["expires"] = new_expires
+            auto_by_cidr[cidr]["reason"] = full_reason
+            extended.append(cidr)
+            continue
+        auto.append({"cidr": cidr, "added": now_str, "expires": new_expires, "reason": full_reason})
+        added.append((cidr, full_reason))
+
+    for cidr, r in added:
+        logging.info("BLOCK %s — %s", cidr, r)
+    for cidr in extended:
+        logging.info("EXTEND %s — TTL refreshed", cidr)
+
+    if dry_run:
+        logging.info("--dry-run: %d new, %d extended — NOT applied",
+                     len(added), len(extended))
+        return
+
+    if not added and not extended:
+        return
+
+    write_blocked(cfg["blocked_conf"], manual, auto)
+    if nginx_reload():
+        logging.info("reloaded: %d new, %d extended", len(added), len(extended))
+    else:
+        logging.error("RELOAD FAILED, blocks written but not active")
+
+
+def cmd_show_scores(cfg):
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=cfg["window_minutes"])
+    whitelist = load_whitelist(cfg["whitelist"])
+    asn_db = load_asn_db(cfg["asn_db"])
+    rep_cache = load_rep_cache(cfg["rep_cache"])
+    stats = scan_log(window_start, cfg)
+    rows = all_scored(stats, whitelist, asn_db, rep_cache, cfg, limit=30)
+    save_rep_cache(cfg["rep_cache"], rep_cache)
+
+    print(f"\nWindow: last {cfg['window_minutes']} min, total subnets: {len(stats)}, "
+          f"ASN DB: {'loaded' if asn_db else 'MISSING'}, cached reputations: {len(rep_cache)}")
+    print(f"Threshold: ≥{cfg['score_threshold']}/11")
+    print(f"Signals: UA(+2) Target(+1/+1) Top3(+1/+1) Ref(+1/+1) ip-api[host|proxy](+3) mobile(-1)\n")
+    print(f"{'SCORE':>5} {'SUBNET':<22} {'REQS':>5} {'MARK':<5} {'UA':>2} {'TGT%':>4} {'TOP3%':>5} {'REF%':>4}  ipapi  ASN")
+    print("-" * 140)
+    for pts, net, n, reasons, wl, s, asn_desc, ipapi in rows:
+        marker = "WL" if wl else ("*BLK*" if pts >= cfg["score_threshold"] else "")
+        ua_n = len(s["uas"])
+        tgt_pct = int(s["target"] * 100 / n)
+        top3 = sum(c for _, c in s["paths"].most_common(3))
+        top3_pct = int(top3 * 100 / n)
+        ref_pct = int(s["with_referer"] * 100 / n)
+        if ipapi is None:
+            ipapi_tag = "?"
+        else:
+            tags = []
+            if ipapi.get("hosting"): tags.append("H")
+            if ipapi.get("proxy"):   tags.append("P")
+            if ipapi.get("mobile"):  tags.append("M")
+            ipapi_tag = "".join(tags) or "-"
+        asn_short = (asn_desc or "?")[:50]
+        print(f"{pts:>5} {str(net):<22} {n:>5} {marker:<5} {ua_n:>2} {tgt_pct:>3}% {top3_pct:>4}% {ref_pct:>3}%  {ipapi_tag:<5}  {asn_short}")
+    if not rows:
+        print(f"(no subnets above min_requests={cfg['min_requests']})")
+
+
+def cmd_cleanup(cfg):
+    now = datetime.now(timezone.utc)
+    manual, auto = read_blocked(cfg["blocked_conf"])
+    kept, removed = [], []
+    for e in auto:
+        try:
+            exp = datetime.strptime(e["expires"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        except ValueError:
+            kept.append(e)
+            continue
+        if exp < now:
+            removed.append(e["cidr"])
+        else:
+            kept.append(e)
+
+    if removed:
+        for cidr in removed:
+            logging.info("UNBLOCK %s — expired", cidr)
+        write_blocked(cfg["blocked_conf"], manual, kept)
+        if nginx_reload():
+            logging.info("reloaded: %d expired removed", len(removed))
+    else:
+        logging.info("cleanup: nothing expired")
+
+    # Prune stale reputation cache entries
+    rep_cache = load_rep_cache(cfg["rep_cache"])
+    now_ts = int(time.time())
+    ttl = cfg["rep_cache_ttl_days"] * 86400
+    stale = [k for k, v in rep_cache.items() if (now_ts - v.get("queried_at", 0)) > ttl]
+    for k in stale:
+        del rep_cache[k]
+    if stale:
+        save_rep_cache(cfg["rep_cache"], rep_cache)
+        logging.info("rep cache: pruned %d stale entries", len(stale))
+
+
+def setup_logging(log_file):
+    fmt = "%(asctime)s %(levelname)s %(message)s"
+    Path(log_file).parent.mkdir(parents=True, exist_ok=True)
+    logging.basicConfig(filename=log_file, level=logging.INFO, format=fmt)
+    h = logging.StreamHandler(sys.stderr)
+    h.setFormatter(logging.Formatter(fmt))
+    logging.getLogger().addHandler(h)
+
+
+def main():
+    p = argparse.ArgumentParser(description="nginx-autoblock — behavioral subnet autoblocker for Nginx")
+    p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config file (default: {DEFAULT_CONFIG_PATH})")
+    p.add_argument("--dry-run", action="store_true", help="Show candidates without writing")
+    p.add_argument("--show-scores", action="store_true", help="Show top-30 subnets with scores (diagnostic)")
+    p.add_argument("--cleanup", action="store_true", help="Remove expired auto-bans")
+    args = p.parse_args()
+
+    cfg = load_config(args.config)
+    setup_logging(cfg["log_file"])
+
+    if args.cleanup:
+        cmd_cleanup(cfg)
+    elif args.show_scores:
+        cmd_show_scores(cfg)
+    else:
+        cmd_run(cfg, dry_run=args.dry_run)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,15 @@
+# nginx-autoblock cron schedule
+# Install: cp cron.d/nginx-autoblock /etc/cron.d/nginx-autoblock && chmod 644 /etc/cron.d/nginx-autoblock
+
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+MAILTO=""
+
+# Every 10 minutes — detect and block bot subnets
+*/10 * * * * root /usr/local/bin/autoblock
+
+# Daily 02:00 UTC — refresh ip2asn database (atomic update via .new + rename)
+0 2 * * * root /usr/bin/curl -sLo /var/lib/nginx-autoblock/ip2asn-combined.tsv.gz.new https://iptoasn.com/data/ip2asn-combined.tsv.gz && /usr/bin/test -s /var/lib/nginx-autoblock/ip2asn-combined.tsv.gz.new && /bin/mv /var/lib/nginx-autoblock/ip2asn-combined.tsv.gz.new /var/lib/nginx-autoblock/ip2asn-combined.tsv.gz
+
+# Daily 03:30 UTC — remove expired auto-bans
+30 3 * * * root /usr/local/bin/autoblock --cleanup
