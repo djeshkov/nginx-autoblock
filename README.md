@@ -184,9 +184,18 @@ Manual entries (lines without an `# auto added=...` comment) are **never** touch
 
 All data fetched at runtime / install time. No vendor secrets, no API keys required for default operation.
 
+## Contributing
+
+Contributions welcome — bug reports, feature ideas, code, docs improvements. See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, code style, and what kinds of contributions are most useful.
+
+- **Bugs**: open an [issue](https://github.com/djeshkov/nginx-autoblock/issues/new?template=bug_report.yml).
+- **Feature ideas / new signals**: open an [issue](https://github.com/djeshkov/nginx-autoblock/issues/new?template=feature_request.yml).
+- **Questions / tuning advice / sharing configs**: open a [Discussion](https://github.com/djeshkov/nginx-autoblock/discussions).
+- **Security vulnerabilities**: see [SECURITY.md](SECURITY.md) — please do **not** file public issues.
+
 ## License
 
-MIT. See `LICENSE`.
+MIT. See [LICENSE](LICENSE).
 
 ## Acknowledgements
 

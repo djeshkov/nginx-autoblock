@@ -1,0 +1,76 @@
+name: Bug report
+description: Report a problem with nginx-autoblock
+labels: [bug, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report.
+        **Before submitting**, please anonymize any real IPs in logs and configs.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Clear description of the unexpected behavior
+      placeholder: |
+        e.g. "autoblock blocked a subnet that I expected to be safe"
+        or "the script crashed with exception X when running --cleanup"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: e.g. "The subnet 198.51.100.0/24 should be skipped because it's in my whitelist"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Steps that lead to the issue
+      placeholder: |
+        1. Config has min_requests=200 and score_threshold=7
+        2. Subnet X is in whitelist
+        3. Run `sudo autoblock --show-scores`
+        4. Subnet X appears with marker *BLK* even though it should be WL
+    validations:
+      required: true
+
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      placeholder: |
+        - OS: e.g. Ubuntu 24.04
+        - Python: e.g. 3.12.0
+        - nginx: e.g. 1.27.4
+        - Commit hash or release tag: e.g. abc1234
+        - Behind CDN: e.g. Cloudflare / no
+    validations:
+      required: true
+
+  - type: textarea
+    id: config
+    attributes:
+      label: Config (anonymized)
+      description: Paste your config.env with paths/secrets redacted
+      render: ini
+
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: |
+        Paste relevant output from `--show-scores` or `--dry-run` or the log file.
+        ANONYMIZE real IPs (replace with 198.51.100.X / 203.0.113.X for examples).
+      render: shell
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Anything else worth knowing
