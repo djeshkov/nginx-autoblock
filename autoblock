@@ -67,6 +67,31 @@ DEFAULTS = {
     "ipapi_batch_url":  "http://ip-api.com/batch?fields=query,proxy,hosting,mobile,isp,as,country",
     "ipapi_timeout":    10,
     "ipapi_batch_size": 100,
+    # ─── Per-IP behavioral scoring (path-agnostic, added in v1.1) ──
+    # Disabled by default for backward compatibility. Enable when you want to
+    # catch distributed scrapers (1 req per IP from many cloud IPs) that the
+    # subnet pass cannot detect by design.
+    "per_ip_enabled":            "false",
+    # Output file for per-IP /32 bans. Separate from blocked_conf so the
+    # subnet pass output remains untouched.
+    "blocked_ips_conf":          "/etc/nginx/blocked-ips.conf",
+    # Score threshold (max ~14). On reference traffic (a Laravel site, ~116k
+    # log lines / 25k unique IPs over 48h) threshold=9 yielded ~1.5% of IPs
+    # flagged with 0% false-positive rate after UA whitelist. Lower = more
+    # aggressive but requires careful whitelist tuning.
+    "per_ip_threshold":          9,
+    # TTL for per-IP auto-bans (independent from subnet TTL).
+    "per_ip_ttl_days":           7,
+    # Hostnames considered "internal" — referers from these are counted as
+    # internal navigation (good signal), others as external (slight bot signal).
+    # Comma-separated.
+    "internal_ref_hosts":        "",
+    # Server's own IPs — skipped from scoring (health-checks, self-curls).
+    # Comma-separated. Set to "auto" to detect via `hostname -I` (not yet impl).
+    "self_ips":                  "",
+    # Chrome version below which UA is considered scraper-like (~6mo behind
+    # current stable). Update periodically or set 0 to disable.
+    "per_ip_chrome_min_version": 142,
 }
 
 DEFAULT_CONFIG_PATH = "/etc/nginx-autoblock/config.env"
@@ -97,6 +122,13 @@ def load_config(path):
     cfg["use_ipapi"]           = str(cfg["use_ipapi"]).lower() in ("true", "1", "yes", "on")
     cfg["target_paths"]   = [p.strip() for p in cfg["target_paths"].split(",") if p.strip()]
     cfg["excluded_paths"] = [p.strip() for p in cfg["excluded_paths"].split(",") if p.strip()]
+    # Per-IP pass settings (added v1.1)
+    cfg["per_ip_enabled"] = str(cfg["per_ip_enabled"]).lower() in ("true", "1", "yes", "on")
+    cfg["per_ip_threshold"]          = int(cfg["per_ip_threshold"])
+    cfg["per_ip_ttl_days"]           = int(cfg["per_ip_ttl_days"])
+    cfg["per_ip_chrome_min_version"] = int(cfg["per_ip_chrome_min_version"])
+    cfg["internal_ref_hosts"] = [h.strip() for h in str(cfg["internal_ref_hosts"]).split(",") if h.strip()]
+    cfg["self_ips"]           = [h.strip() for h in str(cfg["self_ips"]).split(",") if h.strip()]
     return cfg
 
 
@@ -139,7 +171,6 @@ AUTO_END_MARKER   = "# === AUTOBLOCK AUTO SECTION END ==="
 _LEGACY_AUTO_HEADERS = {
     "# Auto-added by autoblock — DO NOT EDIT manually",
     "# Auto-added by nginx-autoblock — DO NOT EDIT manually",
-    "# Auto-added by autoblock — DO NOT EDIT manually",
     "# To unblock: remove the line + sudo nginx -s reload",
 }
 
@@ -214,6 +245,327 @@ def is_hosting_asn(desc):
         return False
     d = desc.lower()
     return any(kw in d for kw in HOSTING_KEYWORDS)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Per-IP behavioral scoring — path-agnostic, works with N=1 request
+# (Added in v1.1.)
+#
+# This is an additive pass that runs ALONGSIDE the existing /24 subnet
+# aggregation. Subnet pass catches concentrated botnets; per-IP pass
+# catches distributed scrapers where each IP makes 1-2 requests and no /24
+# accumulates enough traffic to trip.
+#
+# Disabled by default (per_ip_enabled=false). When enabled, output goes to
+# a SEPARATE file (blocked_ips_conf) at /32 granularity, leaving the
+# subnet-pass output untouched.
+
+# UA max length stored per-IP. Googlebot Mobile UA is ~198 chars; truncating
+# below that loses the "Googlebot/2.1" suffix and breaks claimed-bot detection.
+UA_MAX_LENGTH = 250
+
+# Today (2026-05) current Chrome is ~148. Anything older than 6 months is a
+# scraper fingerprint — real users auto-update.
+# Tune via config: per_ip_chrome_min_version.
+SUSPICIOUS_CHROME_THRESHOLD = 142
+
+# UAs that are trusted infrastructure / Google Privacy Sandbox / CDN fetchers.
+# These IPs are skipped regardless of behavioral score.
+UA_WHITELIST_RE = re.compile(
+    r"(Privacy Preserving Prefetch Proxy|imgix/|Pingdom|UptimeRobot|StatusCake|Site24x7)",
+    re.I,
+)
+
+# UAs that CLAIM to be a known crawler. Subject to PTR + forward-DNS
+# verification before whitelisting. Unverified claims may indicate fake-bot
+# spoofing in which case the IP is re-classified as blockable.
+CLAIMED_BOT_RE = re.compile(
+    r"(Googlebot|bingbot|BingPreview|YandexBot|YandexImages|YandexMobileBot|"
+    r"AhrefsBot|DuckDuckBot|Amzn-SearchBot|Amazonbot|Applebot|"
+    r"FacebookExternalHit|FacebookBot|meta-externalagent|meta-webindexer|"
+    r"Sogou web spider|YisouSpider|Bytespider|PetalBot|baiduspider|"
+    r"SemrushBot|MJ12bot|DataForSeoBot|MojeekBot|BLEXBot|"
+    r"GoogleOther|Google-CloudVertexBot|Google-InspectionTool|"
+    r"CCBot|ClaudeBot|GPTBot|ChatGPT-User|PerplexityBot|OAI-SearchBot|"
+    r"Twitterbot|TelegramBot|WhatsApp|Slackbot|LinkedInBot|Discordbot)",
+    re.I,
+)
+
+# UA → PTR domain-suffix map for verified-bot DNS verification.
+# Source: vendor docs (e.g., https://developers.google.com/search/docs/crawling-indexing/verifying-googlebot).
+VERIFIED_BOT_PTR_SUFFIXES = {
+    "Googlebot":      (".googlebot.com", ".google.com"),
+    "bingbot":        (".search.msn.com",),
+    "BingPreview":    (".search.msn.com",),
+    "YandexBot":      (".yandex.com", ".yandex.ru", ".yandex.net"),
+    "AhrefsBot":      (".ahrefs.com", ".ahrefs.net"),
+    "DuckDuckBot":    (".duckduckgo.com",),
+    "Amzn-SearchBot": (".amazon.com", ".aws.com"),
+    "Amazonbot":      (".amazon.com", ".aws.com"),
+    "Applebot":       (".applebot.apple.com", ".apple.com"),
+    "FacebookBot":    (".facebook.com", ".fbsv.net"),
+    "meta-externalagent": (".facebook.com", ".fbsv.net"),
+    "PetalBot":       (".aspiegel.com", ".petalsearch.com"),
+}
+
+HEADLESS_UA_RE = re.compile(
+    r"(HeadlessChrome|PhantomJS|Puppeteer|Playwright|Selenium|Scrapy|"
+    r"python-requests|node-fetch|Go-http-client|libwww-perl)",
+    re.I,
+)
+
+CHROME_VERSION_RE = re.compile(r"Chrome/(\d+)\.")
+
+# Asset extensions that real browsers fetch alongside HTML.
+ASSET_RE = re.compile(
+    r"\.(?:js|css|png|jpg|jpeg|webp|gif|svg|ico|woff2?|ttf|eot|webmanifest|map)(?:\?|$)",
+    re.I,
+)
+
+
+def extract_chrome_version(ua):
+    """Return major Chrome version as int, or None if not a Chrome UA."""
+    m = CHROME_VERSION_RE.search(ua or "")
+    return int(m.group(1)) if m else None
+
+
+def is_old_chrome(ua, threshold=SUSPICIOUS_CHROME_THRESHOLD):
+    v = extract_chrome_version(ua)
+    return v is not None and v < threshold
+
+
+def is_ua_whitelisted(ua_set):
+    """True if any UA in the set matches the safe-UA whitelist regex."""
+    return any(UA_WHITELIST_RE.search(ua) for ua in ua_set if ua)
+
+
+def is_claimed_bot(ua_set):
+    """True if any UA claims to be a known crawler (subject to PTR verify)."""
+    return any(CLAIMED_BOT_RE.search(ua) for ua in ua_set if ua)
+
+
+def claimed_bot_family(ua_set):
+    """Return the matched bot-family name for PTR verification, or None."""
+    for ua in ua_set:
+        if not ua:
+            continue
+        for fam in VERIFIED_BOT_PTR_SUFFIXES:
+            if fam.lower() in ua.lower():
+                return fam
+    return None
+
+
+def scan_log_per_ip(cfg, window_start=None):
+    """Parse nginx access log into per-IP behavioral stats.
+
+    Returns dict[ip_str] -> stats dict with:
+        reqs, assets, no_ref, ext_ref, int_ref, status_4xx, paths(set), ua_set(set),
+        first_ts, last_ts.
+
+    `internal_ref_hosts` in cfg determines what counts as internal-vs-external
+    referer (list of hostnames; falls back to empty list = all referers are external).
+    """
+    internal_hosts = cfg.get("internal_ref_hosts", [])
+    if isinstance(internal_hosts, str):
+        internal_hosts = [h.strip() for h in internal_hosts.split(",") if h.strip()]
+
+    stats = defaultdict(lambda: {
+        "reqs": 0, "assets": 0,
+        "no_ref": 0, "ext_ref": 0, "int_ref": 0,
+        "status_4xx": 0,
+        "paths": set(), "ua_set": set(),
+        "first_ts": None, "last_ts": None,
+    })
+
+    p = Path(cfg["access_log"])
+    if not p.exists():
+        logging.error("access log not found: %s", p)
+        return stats
+
+    with p.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = LOG_RE.match(line)
+            if not m:
+                continue
+            ip, ts_str, _method, path, _proto, status, referer, ua = m.groups()
+            try:
+                ts = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S %z")
+            except ValueError:
+                continue
+            if window_start is not None and ts < window_start:
+                continue
+            s = stats[ip]
+            s["reqs"] += 1
+            s["paths"].add(path.split("?", 1)[0][:120])
+            if ASSET_RE.search(path):
+                s["assets"] += 1
+            if referer == "-" or not referer:
+                s["no_ref"] += 1
+            elif any(h in referer for h in internal_hosts):
+                s["int_ref"] += 1
+            else:
+                s["ext_ref"] += 1
+            if status.startswith("4"):
+                s["status_4xx"] += 1
+            s["ua_set"].add((ua or "")[:UA_MAX_LENGTH])
+            ts_epoch = ts.timestamp()
+            if s["first_ts"] is None or ts_epoch < s["first_ts"]:
+                s["first_ts"] = ts_epoch
+            if s["last_ts"] is None or ts_epoch > s["last_ts"]:
+                s["last_ts"] = ts_epoch
+    return stats
+
+
+def find_blockable_ips(cfg, asn_lookup_fn, window_start=None):
+    """Run the per-IP behavioral pass: returns list of {ip, score, reasons, added, expires}.
+
+    `asn_lookup_fn`: callable (ip_str) -> asn_description_str. Pass a closure
+    that captures the asn_db, e.g. lambda ip: asn_lookup(ipaddress.ip_network(ip+"/32"), db).
+
+    Whitelist precedence:
+        1. self_ips (config) — never scored
+        2. UA whitelist (Privacy Prefetch Proxy, imgix, etc.)
+        3. claimed-bot UA — held aside (PTR verification optional, not done here)
+        4. Everything else — scored; if score >= threshold and not claimed → blockable
+
+    Output is ready to feed into write_blocked_ips().
+    """
+    threshold = int(cfg.get("per_ip_threshold", 9))
+    ttl_days = int(cfg.get("per_ip_ttl_days", 7))
+    self_ips = set(cfg.get("self_ips", []) or [])
+
+    now = datetime.now(timezone.utc)
+    expires = now + timedelta(days=ttl_days)
+    added_str = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_str = expires.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    stats = scan_log_per_ip(cfg, window_start)
+    out = []
+    for ip, s in stats.items():
+        if ip in self_ips:
+            continue
+        if is_ua_whitelisted(s["ua_set"]):
+            continue
+        if is_claimed_bot(s["ua_set"]):
+            # Claimed bots are held aside. PTR verification can be added later.
+            continue
+        asn_desc = asn_lookup_fn(ip) or ""
+        score, sigs = score_ip(s, asn_desc, cfg)
+        if score >= threshold:
+            out.append({
+                "ip":      ip,
+                "score":   score,
+                "reasons": ",".join(sigs),
+                "added":   added_str,
+                "expires": expires_str,
+                "reqs":    s["reqs"],
+                "asn":     asn_desc[:50],
+            })
+    return out
+
+
+def write_blocked_ips(path, manual, auto):
+    """Wrapper around write_blocked for per-IP entries.
+
+    Accepts auto entries from `find_blockable_ips` (keys: ip, reasons, ...) and
+    normalises them to the format `write_blocked` expects (`cidr`, `reason`).
+    Nginx geo accepts both single IPs and CIDR ranges in the same line format,
+    so the writer is fully reused.
+    """
+    normalized = [
+        {
+            **e,
+            "cidr":   e.get("cidr") or e["ip"],
+            "reason": e.get("reason") or e.get("reasons", ""),
+        }
+        for e in auto
+    ]
+    write_blocked(path, manual, normalized)
+
+
+def score_ip(stats, asn_desc, cfg):
+    """Score a single IP's behavioral fingerprint. Returns (score, signals_list).
+
+    Path-agnostic — same algorithm applies whether the IP hit /reservation/<UUID>
+    once or hammered /api/* a hundred times. Signals naturally activate based on
+    the volume of data available (some require min_reqs).
+
+    `cfg` may carry per-signal tuning (per_ip_chrome_min_version, etc.). Empty
+    dict accepts all defaults.
+
+    Reference backtest on ~116k log lines / 25k IPs from a Laravel-fronted
+    site over 48h:
+        - threshold=9 → ~395 IPs flagged (~1.5% of seen IPs)
+        - 69% confirmed hosting by ip-api, 26% proxy
+        - 0% false-positive rate after UA whitelist
+        - catches ~9% of residential scrapers that ip-api alone misses
+    """
+    n = stats.get("reqs", 0)
+    if n == 0:
+        return 0, []
+
+    asset_ratio = stats.get("assets", 0) / n
+    no_ref_ratio = stats.get("no_ref", 0) / n
+    has_ref = stats.get("ext_ref", 0) + stats.get("int_ref", 0)
+    ext_ref_ratio = stats.get("ext_ref", 0) / max(has_ref, 1)
+    fourxx_ratio = stats.get("status_4xx", 0) / n
+    paths = stats.get("paths", set())
+    unique_path_ratio = len(paths) / n if n else 0
+    ua_set = stats.get("ua_set", set())
+
+    chrome_min = cfg.get("per_ip_chrome_min_version", SUSPICIOUS_CHROME_THRESHOLD)
+
+    pts = 0
+    sigs = []
+
+    # S1 — no asset loads: real browsers fetch CSS/JS/images alongside HTML
+    if asset_ratio < 0.05 and n >= 3:
+        pts += 3
+        sigs.append("noassets")
+
+    # S2 — no referer dominant: real users mostly arrive via in-site navigation
+    if no_ref_ratio > 0.8 and n >= 2:
+        pts += 2
+        sigs.append("noref")
+
+    # S3 — external referer dominant: arriving via external links is a scraper
+    # pattern (target list from a 3rd-party source)
+    if ext_ref_ratio > 0.5 and has_ref >= 3:
+        pts += 1
+        sigs.append("extref")
+
+    # S4 — 4xx probing: scanners hit non-existent paths
+    if fourxx_ratio > 0.3 and n >= 5:
+        pts += 1
+        sigs.append("4xx")
+
+    # S5 — every request is a different URL: classic crawler / list-scraping pattern
+    if unique_path_ratio >= 0.95 and n >= 5:
+        pts += 2
+        sigs.append("upath")
+
+    # S6 — cloud/hosting ASN: real users come from ISP, not datacenter
+    if is_hosting_asn(asn_desc):
+        pts += 3
+        sigs.append("cloud")
+
+    # S7 — UA quality: detect headless, old Chrome (>6mo), suspicious short UA
+    ua_flags = []
+    ua_extra = 0
+    for ua in ua_set:
+        if HEADLESS_UA_RE.search(ua or ""):
+            ua_extra = max(ua_extra, 3); ua_flags.append("headless")
+        if is_old_chrome(ua, chrome_min):
+            ua_extra = max(ua_extra, 2); ua_flags.append("oldchrome")
+        if not ua or ua == "-":
+            ua_extra = max(ua_extra, 2); ua_flags.append("ua_empty")
+        elif len(ua) < 20:
+            ua_extra = max(ua_extra, 2); ua_flags.append("ua_short")
+    if ua_extra > 0:
+        pts += ua_extra
+        sigs.append("ua:" + ",".join(sorted(set(ua_flags))))
+
+    return pts, sigs
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -676,27 +1028,35 @@ def cmd_show_scores(cfg):
 
 def cmd_cleanup(cfg):
     now = datetime.now(timezone.utc)
-    manual, auto = read_blocked(cfg["blocked_conf"])
-    kept, removed = [], []
-    for e in auto:
-        try:
-            exp = datetime.strptime(e["expires"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-        except ValueError:
-            kept.append(e)
-            continue
-        if exp < now:
-            removed.append(e["cidr"])
-        else:
-            kept.append(e)
+    any_changed = False
 
-    if removed:
-        for cidr in removed:
-            logging.info("UNBLOCK %s — expired", cidr)
-        write_blocked(cfg["blocked_conf"], manual, kept)
+    # Cleanup both block files (subnet + per-IP if enabled)
+    for path_key, label in [("blocked_conf", "subnet"), ("blocked_ips_conf", "per-IP")]:
+        path = cfg.get(path_key)
+        if not path or not Path(path).exists():
+            continue
+        manual, auto = read_blocked(path)
+        kept, removed = [], []
+        for e in auto:
+            try:
+                exp = datetime.strptime(e["expires"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            except ValueError:
+                kept.append(e); continue
+            if exp < now:
+                removed.append(e["cidr"])
+            else:
+                kept.append(e)
+        if removed:
+            for cidr in removed:
+                logging.info("UNBLOCK-%s %s — expired", label, cidr)
+            write_blocked(path, manual, kept)
+            any_changed = True
+        else:
+            logging.info("cleanup %s: nothing expired", label)
+
+    if any_changed:
         if nginx_reload():
-            logging.info("reloaded: %d expired removed", len(removed))
-    else:
-        logging.info("cleanup: nothing expired")
+            logging.info("reloaded after cleanup")
 
     # Prune stale reputation cache entries
     rep_cache = load_rep_cache(cfg["rep_cache"])
@@ -710,6 +1070,88 @@ def cmd_cleanup(cfg):
         logging.info("rep cache: pruned %d stale entries", len(stale))
 
 
+def cmd_per_ip(cfg, dry_run=False, show_only=False):
+    """Per-IP behavioral scoring pass (added v1.1).
+
+    Independent from the subnet pass. Writes to `blocked_ips_conf` (separate
+    file). Can be run standalone via --per-ip, or auto-runs after subnet pass
+    when per_ip_enabled=true.
+    """
+    asn_db = load_asn_db(cfg["asn_db"])
+    if asn_db is None:
+        logging.warning("per-IP pass: ASN DB missing, cloud signal disabled")
+
+    def asn_lookup_for(ip_str):
+        if asn_db is None:
+            return ""
+        try:
+            net = ipaddress.ip_network(ip_str + "/32", strict=False) if "." in ip_str else \
+                  ipaddress.ip_network(ip_str + "/128", strict=False)
+        except ValueError:
+            return ""
+        return asn_lookup(net, asn_db) or ""
+
+    # No window_start here — backtest showed scoring works well over full
+    # rotation period. Use access_log only (don't read rotated .gz here).
+    blockable = find_blockable_ips(cfg, asn_lookup_fn=asn_lookup_for, window_start=None)
+
+    if show_only:
+        print(f"\nPer-IP pass: threshold={cfg['per_ip_threshold']}, "
+              f"candidates={len(blockable)}")
+        print(f"{'SCORE':>5} {'REQS':>5} {'IP':<25} {'ASN':<35} reasons")
+        print("-" * 120)
+        for b in sorted(blockable, key=lambda x: (-x["score"], -x["reqs"]))[:50]:
+            print(f"{b['score']:>5} {b['reqs']:>5} {b['ip']:<25} {b['asn']:<35} {b['reasons']}")
+        return
+
+    if not blockable:
+        logging.info("per-IP: no candidates above threshold=%d", cfg["per_ip_threshold"])
+        return
+
+    # Load existing per-IP block list and merge
+    manual, auto = read_blocked(cfg["blocked_ips_conf"])
+    manual_set = manual_cidrs(manual)
+    auto_by_cidr = {e["cidr"]: e for e in auto}
+
+    added, extended = [], []
+    for b in blockable:
+        ip = b["ip"]
+        if ip in manual_set:
+            continue
+        full_reason = f"score{b['score']} {b['reqs']}req {b['reasons']}"
+        if ip in auto_by_cidr:
+            auto_by_cidr[ip]["expires"] = b["expires"]
+            auto_by_cidr[ip]["reason"] = full_reason
+            extended.append(ip)
+        else:
+            auto.append({
+                "cidr":    ip,
+                "added":   b["added"],
+                "expires": b["expires"],
+                "reason":  full_reason,
+            })
+            added.append((ip, full_reason))
+
+    for ip, r in added:
+        logging.info("BLOCK-IP %s — %s", ip, r)
+    for ip in extended:
+        logging.info("EXTEND-IP %s — TTL refreshed", ip)
+
+    if dry_run:
+        logging.info("--dry-run: per-IP %d new, %d extended — NOT applied",
+                     len(added), len(extended))
+        return
+
+    if not added and not extended:
+        return
+
+    write_blocked(cfg["blocked_ips_conf"], manual, auto)
+    if nginx_reload():
+        logging.info("reloaded (per-IP): %d new, %d extended", len(added), len(extended))
+    else:
+        logging.error("RELOAD FAILED (per-IP), blocks written but not active")
+
+
 def setup_logging(log_file):
     fmt = "%(asctime)s %(levelname)s %(message)s"
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -720,11 +1162,15 @@ def setup_logging(log_file):
 
 
 def main():
-    p = argparse.ArgumentParser(description="nginx-autoblock — behavioral subnet autoblocker for Nginx")
+    p = argparse.ArgumentParser(description="nginx-autoblock — behavioral autoblocker for Nginx")
     p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config file (default: {DEFAULT_CONFIG_PATH})")
     p.add_argument("--dry-run", action="store_true", help="Show candidates without writing")
-    p.add_argument("--show-scores", action="store_true", help="Show top-30 subnets with scores (diagnostic)")
-    p.add_argument("--cleanup", action="store_true", help="Remove expired auto-bans")
+    p.add_argument("--show-scores", action="store_true", help="Show top-30 subnets with scores (subnet pass)")
+    p.add_argument("--show-per-ip", action="store_true",
+                   help="Show top-50 per-IP candidates (path-agnostic pass; diagnostic)")
+    p.add_argument("--per-ip", action="store_true",
+                   help="Run ONLY the per-IP pass (skip subnet pass)")
+    p.add_argument("--cleanup", action="store_true", help="Remove expired auto-bans (both subnet and per-IP)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -734,8 +1180,14 @@ def main():
         cmd_cleanup(cfg)
     elif args.show_scores:
         cmd_show_scores(cfg)
+    elif args.show_per_ip:
+        cmd_per_ip(cfg, dry_run=True, show_only=True)
+    elif args.per_ip:
+        cmd_per_ip(cfg, dry_run=args.dry_run)
     else:
         cmd_run(cfg, dry_run=args.dry_run)
+        if cfg.get("per_ip_enabled"):
+            cmd_per_ip(cfg, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

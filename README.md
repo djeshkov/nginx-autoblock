@@ -1,23 +1,33 @@
 # nginx-autoblock
 
-Behavioral subnet autoblocker for Nginx. Detects bot crawlers by **composite scoring** across multiple signals (UA diversity, request patterns, IP reputation) and adds offending **subnets** to nginx's block-list with TTL.
+Behavioral autoblocker for Nginx. Detects bot crawlers by **composite scoring** across multiple signals (UA diversity, request patterns, IP reputation, behavioral fingerprint) and adds offending **subnets and individual IPs** to nginx's block-list with TTL.
 
-Designed for sites fronted by Cloudflare or another CDN, where per-IP rate-limiting misses **distributed crawls** that spread requests across dozens of IPs in the same /24.
+Designed for two threat classes that per-IP rate-limiting (`limit_req_zone $binary_remote_addr`) misses:
+- **Concentrated botnets** — same /24 producing 100+ req/h, each IP individually below per-IP limits (subnet pass, default).
+- **Distributed scraping** — hundreds of cloud IPs from many ASNs, 1-2 requests each, mass-scraping public URLs harvested from sitemaps or tournament/product pages (per-IP pass, opt-in since v1.1).
 
 ```
-                ┌─────────────────────────────────────┐
-   nginx logs ──┤  autoblock (every 10 min via cron)  │
-                │   1. group requests by /24 or /64   │
-                │   2. apply 5 behavioral signals     │
-                │   3. enrich via ip-api.com (free)   │
-                │   4. score 0-11, block if ≥7        │
-                └────────────┬────────────────────────┘
-                             │
-                             ▼
-                  /etc/nginx/blocked-subnets.conf
-                             │
-                             ▼
-                   nginx returns 444 to bot
+                ┌─────────────────────────────────────────────────┐
+   nginx logs ──┤  autoblock (every 10 min via cron)              │
+                │                                                 │
+                │   Subnet pass (default):                        │
+                │     group requests by /24 or /64                │
+                │     score 0-11 against 5 behavioral signals     │
+                │     enrich via ip-api.com (free)                │
+                │     block /24 if score ≥ 7                      │
+                │                                                 │
+                │   Per-IP pass (opt-in since v1.1):              │
+                │     score each IP 0-14 (path-agnostic)          │
+                │     catches distributed scrapers (1 req/IP)     │
+                │     block /32 if score ≥ 9                      │
+                └────────────────┬────────────────────────────────┘
+                                 │
+                                 ▼
+                 /etc/nginx/blocked-subnets.conf   (subnet pass)
+                 /etc/nginx/blocked-ips.conf       (per-IP pass)
+                                 │
+                                 ▼
+                       nginx returns 444 to bot
 ```
 
 ## Why this exists
@@ -54,6 +64,54 @@ For each `/24` (IPv4) or `/64` (IPv6) seen in the last 30 minutes, score against
 **Static-asset ratio is NOT a signal.** Behind a CDN, static files (CSS/JS/images) are served from the edge cache — only ~5% of static traffic reaches origin nginx, so this ratio is similar between humans and bots at origin and provides no discrimination.
 
 **ip-api.com batch enrichment** queries up to 100 IPs in one HTTP request, free, no signup. Results cached for 7 days per subnet. Falls back to offline ASN keyword matching (via `iptoasn.com` database) if the API is unreachable.
+
+## Per-IP scoring (distributed scraping)
+
+The subnet pass has an architectural limit: when bot operators spread requests across **many cloud IPs, 1-2 requests each**, no /24 accumulates enough volume to trip. Since **v1.1**, an opt-in second pass scores each IP on its own behavioral fingerprint.
+
+```ini
+# /etc/nginx-autoblock/config.env
+per_ip_enabled=true
+per_ip_threshold=9
+internal_ref_hosts=example.com,www.example.com   # for noref/extref signal
+self_ips=203.0.113.1                              # your origin IP(s)
+```
+
+Then either let the regular cron run pick it up (subnet pass runs first, then per-IP pass), or invoke it directly:
+
+```bash
+sudo autoblock --show-per-ip   # diagnostic — top 50 candidates, read-only
+sudo autoblock --per-ip --dry-run   # what would be blocked
+sudo autoblock --per-ip   # actually block
+```
+
+Output goes to `/etc/nginx/blocked-ips.conf` — separate from the subnet file. Both are included in the same `geo $blocked_subnet` block (see `nginx/blacklist.conf`).
+
+### Signal set (path-agnostic)
+
+| Signal | Trigger | Points | Min req |
+|--------|---------|--------|---------|
+| **noassets** | Asset-loading ratio < 5% | +3 | N ≥ 3 |
+| **noref** | No-referer ratio > 80% | +2 | N ≥ 2 |
+| **extref** | External-referer ratio > 50% | +1 | has-ref ≥ 3 |
+| **4xx** | 4xx-response ratio > 30% | +1 | N ≥ 5 |
+| **upath** | Unique-paths ratio ≥ 95% | +2 | N ≥ 5 |
+| **cloud** | ASN description matches hosting/cloud keywords | +3 | — |
+| **ua:oldchrome** | Chrome major version < threshold (default 142) | +2 | — |
+| **ua:headless** | UA matches HeadlessChrome / Puppeteer / Selenium / Scrapy | +3 | — |
+| **ua:short** | UA length < 20 | +2 | — |
+
+**Maximum score: 14.** Default threshold: 9. Whitelisted UAs (Privacy Preserving Prefetch Proxy, imgix, monitoring services, claimed search-engine bots) skip scoring entirely.
+
+The first 3 path-volume signals (noassets/noref/upath) require multiple requests to fire. The cloud/UA signals work at N=1 — they're what catches single-hit distributed scrapers.
+
+### When to enable
+
+Enable the per-IP pass when you observe **either**:
+- Your access log shows many distinct cloud IPs each hitting one specific endpoint (e.g., `/reservation/<UUID>`, `/product/<ID>`, `/profile/<USER>`) once each.
+- Session-recording or analytics tools show short bot-like sessions (< 5s, 0 clicks) from many countries / IPs — but `--show-scores` (the subnet pass) finds nothing because no /24 is hot enough.
+
+Backtest details and signal calibration: [docs/SCORING.md § Per-IP pass](docs/SCORING.md#per-ip-pass-opt-in).
 
 ## Quick install
 
@@ -173,7 +231,9 @@ Manual entries (lines without an `# auto added=...` comment) are **never** touch
 
 - **Microsoft Azure as a whole** is NOT flagged as hosting by default. This is intentional — many legitimate AI bots (ChatGPT-User, GPTBot) live on Azure, and we'd rather let them through than block ChatGPT. The trade-off: less-known bots from generic Azure subnets are caught only if `ip-api` flags them specifically.
 
-- **Single Cloudflare-fronted setup tested.** The static-ratio caveat assumes a CDN cache in front. For direct-to-origin nginx, you might benefit from re-adding a static-asset-ratio signal.
+- **Single Cloudflare-fronted setup tested.** The static-ratio caveat assumes a CDN cache in front. For direct-to-origin nginx, you might benefit from re-adding a static-asset-ratio signal — or enable the per-IP pass which uses asset-ratio at the individual-IP level.
+
+- **Per-IP pass trusts claimed-bot UAs without PTR verification** as of v1.1. If a scraper spoofs `Googlebot` in its User-Agent, the per-IP pass currently skips it. Full PTR + forward-DNS verification is implementation-ready and tracked for v1.2. Until then, the subnet pass still catches concentrated spoofers, and the UA whitelist for AI bots is separately verified via published IP ranges (`scripts/refresh-ai-whitelist.sh`).
 
 ## Data sources
 
