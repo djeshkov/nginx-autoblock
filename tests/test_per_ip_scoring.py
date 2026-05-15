@@ -1,9 +1,8 @@
-"""TDD contract for per-IP behavioral scoring (v6).
+"""TDD contract for per-IP behavioral scoring.
 
 Each signal is tested in isolation, then composition is tested through threshold
 gating. Whitelist (UA substring, claimed-bot, self-IP) tests cover backward-compat
 fallback path."""
-import pytest
 
 
 # ─────────────────────────────────────────────────────────────────────

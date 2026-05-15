@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: pytest (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install pytest
+        run: pip install --upgrade pip pytest
+
+      - name: Syntax check
+        run: python -m py_compile autoblock
+
+      - name: Run tests
+        run: pytest tests/ -v
+
+  lint-python:
+    name: ruff (lint + format)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install ruff
+        run: pip install ruff==0.7.4
+
+      - name: Lint autoblock + tests
+        # Enforce real bug categories (F = pyflakes errors) and ambiguous-name (E741).
+        # Stylistic rules (E501 long lines, E701/E702 compact one-liners, E402 import
+        # order in tests) are intentionally relaxed — the score_ip function uses
+        # `pts += X; sigs.append(...)` compact form throughout for readability.
+        run: ruff check --select=F,E741 autoblock tests/
+
+      - name: Check format (informational only)
+        run: ruff format --check autoblock tests/ || echo "::warning::Run 'ruff format' locally to align style — non-blocking"
+        continue-on-error: true
+
+  lint-shell:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@2.0.0
+        with:
+          scandir: ./scripts
+          severity: warning

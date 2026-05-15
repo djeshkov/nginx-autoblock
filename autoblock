@@ -1002,7 +1002,7 @@ def cmd_show_scores(cfg):
     print(f"\nWindow: last {cfg['window_minutes']} min, total subnets: {len(stats)}, "
           f"ASN DB: {'loaded' if asn_db else 'MISSING'}, cached reputations: {len(rep_cache)}")
     print(f"Threshold: ≥{cfg['score_threshold']}/11")
-    print(f"Signals: UA(+2) Target(+1/+1) Top3(+1/+1) Ref(+1/+1) ip-api[host|proxy](+3) mobile(-1)\n")
+    print("Signals: UA(+2) Target(+1/+1) Top3(+1/+1) Ref(+1/+1) ip-api[host|proxy](+3) mobile(-1)\n")
     print(f"{'SCORE':>5} {'SUBNET':<22} {'REQS':>5} {'MARK':<5} {'UA':>2} {'TGT%':>4} {'TOP3%':>5} {'REF%':>4}  ipapi  ASN")
     print("-" * 140)
     for pts, net, n, reasons, wl, s, asn_desc, ipapi in rows:
