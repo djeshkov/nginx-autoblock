@@ -112,6 +112,7 @@ Enable the per-IP pass when you observe **either**:
 - Session-recording or analytics tools show short bot-like sessions (< 5s, 0 clicks) from many countries / IPs — but `--show-scores` (the subnet pass) finds nothing because no /24 is hot enough.
 
 Backtest details and signal calibration: [docs/SCORING.md § Per-IP pass](docs/SCORING.md#per-ip-pass-opt-in).
+Real-world first-hour results from a Laravel-fronted reference site: [docs/CASE-STUDY.md](docs/CASE-STUDY.md).
 
 ## Quick install
 
