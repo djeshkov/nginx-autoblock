@@ -128,6 +128,21 @@ AUTO_RE = re.compile(
     r"^(\S+) 1; # auto added=(\S+) expires=(\S+) reason=(.+)$"
 )
 
+# Sentinel markers wrapping the auto-managed section of blocked-subnets.conf.
+# Everything BETWEEN these markers is owned by this script and gets rewritten
+# on every run. Everything OUTSIDE is treated as manual and preserved.
+AUTO_BEGIN_MARKER = "# === AUTOBLOCK AUTO SECTION BEGIN — do not edit ==="
+AUTO_END_MARKER   = "# === AUTOBLOCK AUTO SECTION END ==="
+
+# Legacy header strings stripped on rewrite (accumulated from earlier versions
+# that lacked sentinel markers and re-appended headers each run).
+_LEGACY_AUTO_HEADERS = {
+    "# Auto-added by autoblock — DO NOT EDIT manually",
+    "# Auto-added by nginx-autoblock — DO NOT EDIT manually",
+    "# Auto-added by autoblock — DO NOT EDIT manually",
+    "# To unblock: remove the line + sudo nginx -s reload",
+}
+
 
 # ─────────────────────────────────────────────────────────────────
 # Whitelist / ASN keyword fallback
@@ -460,35 +475,84 @@ def all_scored(stats, whitelist, asn_db, rep_cache, cfg, limit=30):
 # Blocked file management
 
 def read_blocked(path):
+    """
+    Returns (manual_lines, auto_entries).
+
+    The auto section is delimited by AUTO_BEGIN_MARKER / AUTO_END_MARKER.
+    Everything between markers is "auto" and gets rewritten on every run.
+    Everything outside is "manual" and is preserved verbatim.
+
+    For legacy files without markers, falls back to detecting auto entries
+    by pattern (AUTO_RE) wherever they appear.
+    """
     manual, auto = [], []
     p = Path(path)
     if not p.exists():
         return manual, auto
-    for line in p.read_text().splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            manual.append(line)
+
+    lines = p.read_text().splitlines()
+    has_markers = any(line.strip() == AUTO_BEGIN_MARKER for line in lines)
+
+    in_auto = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped == AUTO_BEGIN_MARKER:
+            in_auto = True
             continue
-        m = AUTO_RE.match(line)
-        if m:
-            cidr, added, expires, reason = m.groups()
-            auto.append({"cidr": cidr, "added": added, "expires": expires, "reason": reason})
-        else:
+        if stripped == AUTO_END_MARKER:
+            in_auto = False
+            continue
+        if in_auto:
+            m = AUTO_RE.match(line)
+            if m:
+                cidr, added, expires, reason = m.groups()
+                auto.append({"cidr": cidr, "added": added, "expires": expires, "reason": reason})
+            # Non-entry lines inside auto section (managed headers) — drop them
+            continue
+        # Outside auto section
+        if has_markers:
             manual.append(line)
+        else:
+            # Legacy file: detect auto entries by pattern, drop legacy headers
+            m = AUTO_RE.match(line)
+            if m:
+                cidr, added, expires, reason = m.groups()
+                auto.append({"cidr": cidr, "added": added, "expires": expires, "reason": reason})
+            elif stripped in _LEGACY_AUTO_HEADERS:
+                continue  # legacy duplicate header → strip
+            else:
+                manual.append(line)
     return manual, auto
 
 
 def write_blocked(path, manual, auto):
-    out = list(manual)
+    """
+    Layout:
+        <manual lines verbatim, trailing blank lines stripped>
+        <blank line>
+        AUTO_BEGIN_MARKER
+        <2 explanatory comment lines>
+        <auto entries, sorted by added timestamp>
+        AUTO_END_MARKER
+    Auto section is omitted entirely when there are no auto entries.
+    """
+    cleaned_manual = list(manual)
+    while cleaned_manual and not cleaned_manual[-1].strip():
+        cleaned_manual.pop()
+
+    out = list(cleaned_manual)
     if auto:
-        if out and out[-1].strip():
+        if out:
             out.append("")
-        out.append("# Auto-added by nginx-autoblock — DO NOT EDIT manually")
-        out.append("# To unblock: remove the line + sudo nginx -s reload")
+        out.append(AUTO_BEGIN_MARKER)
+        out.append("# Managed by autoblock script. Lines below auto-expire per TTL.")
+        out.append("# To unblock early: delete the line + sudo nginx -s reload")
         for e in sorted(auto, key=lambda x: x["added"]):
             out.append(
                 f"{e['cidr']} 1; # auto added={e['added']} "
                 f"expires={e['expires']} reason={e['reason']}"
             )
+        out.append(AUTO_END_MARKER)
     Path(path).write_text("\n".join(out) + "\n")
 
 
