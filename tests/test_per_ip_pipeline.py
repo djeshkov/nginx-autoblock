@@ -1,6 +1,5 @@
-"""Integration tests for v6 per-IP pipeline: log → stats → score → block list."""
+"""Integration tests for the per-IP pipeline: log → stats → score → block list."""
 import textwrap
-from pathlib import Path
 
 
 SAMPLE_LOG = textwrap.dedent("""\
@@ -91,6 +90,6 @@ def test_read_blocked_ips_preserves_manual_and_parses_auto(autoblock_mod, tmp_pa
         {autoblock_mod.AUTO_END_MARKER}
         """))
     manual, auto = autoblock_mod.read_blocked(str(f))
-    assert any("9.9.9.9" in l for l in manual)
+    assert any("9.9.9.9" in line for line in manual)
     assert len(auto) == 1
     assert auto[0]["cidr"] == "1.2.3.4"
