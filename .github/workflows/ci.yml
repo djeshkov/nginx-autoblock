@@ -71,3 +71,23 @@ jobs:
         with:
           scandir: ./scripts
           severity: warning
+
+  lint-secrets:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Fetch full history so gitleaks can scan all commits, not just
+          # the current tree — that's the point of secret scanning.
+          fetch-depth: 0
+
+      - name: Install gitleaks
+        run: |
+          version=8.30.1
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
+            | tar -xz -C /usr/local/bin gitleaks
+          gitleaks version
+
+      - name: Scan full history
+        run: gitleaks detect --source . --no-banner --redact --verbose
