@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/djeshkov/nginx-autoblock/security/policy
+    about: Please do NOT open public issues for security problems — see SECURITY.md
+  - name: Question or discussion
+    url: https://github.com/djeshkov/nginx-autoblock/discussions
+    about: For general questions, tuning advice, or sharing configs — use Discussions

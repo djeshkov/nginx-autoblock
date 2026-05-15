@@ -1,0 +1,58 @@
+name: Feature request
+description: Suggest a new feature or scoring signal
+labels: [enhancement, needs-triage]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. Please describe the **use case** before the **solution** —
+        what bot/scenario can't be detected today, and why.
+
+  - type: textarea
+    id: usecase
+    attributes:
+      label: Use case
+      description: What problem are you trying to solve?
+      placeholder: |
+        e.g. "I have bots that come from residential proxies. They have diverse UAs
+        (the proxy network rotates them) so the UA signal doesn't fire, but they
+        all share <some specific pattern X>."
+    validations:
+      required: true
+
+  - type: textarea
+    id: current
+    attributes:
+      label: Why current scoring doesn't catch this
+      description: What score does the offending subnet get today? What's missing?
+      placeholder: |
+        e.g. "On 14d backtest, subnet got score 4: ua_count=8 (no signal),
+        target_ratio=85%, but no hosting flag because the IPs are residential."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What you'd like to see
+      placeholder: |
+        e.g. "Add a signal: request rate stddev (bots have low variance, humans high)"
+        or "Add a new reputation provider for residential proxy detection"
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      placeholder: e.g. "Lowering threshold would help but would cause false positives on X"
+
+  - type: dropdown
+    id: willing-to-implement
+    attributes:
+      label: Would you be willing to implement this?
+      options:
+        - "Yes, I'd like to send a PR"
+        - "Maybe, with guidance"
+        - "No, just suggesting"
+    validations:
+      required: true
