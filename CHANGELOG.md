@@ -5,22 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [v1.1.0] - 2026-05-15
 
-### Added — v6: Per-IP behavioral scoring (path-agnostic)
+### Added — Per-IP behavioral scoring (path-agnostic)
 
-A second, **optional** pass that scores individual IPs by their behavioral
+An optional second pass that scores individual IPs by their behavioral
 fingerprint regardless of how many requests they made. Disabled by default;
 enable in config with `per_ip_enabled=true`.
 
-The motivation is **distributed scraping** — bot operators that spread requests
-across hundreds of cloud IPs, each making 1-2 requests. The v5 subnet pass
-cannot detect this by design (no /24 accumulates enough traffic to trip).
+The motivation is **distributed scraping** — bot operators that spread
+requests across hundreds of cloud IPs, each making 1-2 requests. The subnet
+pass cannot detect this by design (no /24 accumulates enough traffic to trip).
 Per-IP scoring uses signals that work even at N=1: cloud ASN, no-referer,
 no-asset-loads, headless UA, old Chrome version.
 
 - New CLI flags:
-  - `--per-ip` — run only the v6 pass
+  - `--per-ip` — run only the per-IP pass
   - `--show-per-ip` — diagnostic top-50 candidates (read-only)
 - New output file: `blocked-ips.conf` (separate from `blocked-subnets.conf`)
 - New config keys: `per_ip_enabled`, `per_ip_threshold`, `per_ip_ttl_days`,
@@ -36,28 +36,28 @@ Validated on a Laravel site (116k log lines, 25k unique IPs over 48h):
   DigitalOcean / OVH / Hetzner / AWS VMs running scrapers — all with score
   12-13 out of ~14 possible.
 
-The pass uses verified-bot whitelist with PTR-suffix mapping for Googlebot,
-bingbot, YandexBot, AhrefsBot, etc. Currently the script trusts the UA
-substring; full PTR + forward-DNS verification is implementation-ready but
-not wired by default (see backtest scripts in repo discussions).
+The pass ships PTR-suffix mappings for verified bots (Googlebot → `.googlebot.com`,
+bingbot → `.search.msn.com`, etc.) but currently trusts UA substring without
+DNS verification. Full PTR + forward-DNS verification is implementation-ready
+and tracked for v1.2.
 
 ### Changed
 
 - `nginx/blacklist.conf` now sources two block files instead of one. Both are
   optional — nginx degrades gracefully when either is absent.
+- README, docs/SCORING.md restructured around two pass concepts:
+  *subnet pass* (existing, default) and *per-IP pass* (new, opt-in).
 
-### Notes for v5 users
+### Backward compatibility
 
-This release is **fully backward compatible**. If you do not set
-`per_ip_enabled=true`, behavior is identical to v5.1. The new `blocked-ips.conf`
-include in `nginx/blacklist.conf` is safe even when the file does not exist
-(nginx logs a warning at reload but continues).
+Fully backward compatible. If `per_ip_enabled=true` is not set, behaviour is
+identical to v1.0.1. The new `blocked-ips.conf` include in `nginx/blacklist.conf`
+is safe even when the file does not exist (nginx logs a warning at reload but
+continues).
 
-To start using v6, see [README.md § Per-IP scoring](README.md#v6--per-ip-scoring-distributed-scraping).
+To start using the per-IP pass, see [README.md § Per-IP scoring](README.md#per-ip-scoring-distributed-scraping).
 
----
-
-## [v5.1] - 2026-05-15
+## [v1.0.1] - 2026-05-15
 
 ### Fixed
 
@@ -69,23 +69,19 @@ To start using v6, see [README.md § Per-IP scoring](README.md#v6--per-ip-scorin
   everything between markers is owned by the script, everything outside is
   manual. Legacy header strings are stripped on first rewrite.
 
-## [v5.0] - 2026-05-14
+## [v1.0.0] - 2026-05-11
 
-### Added
+Initial public release.
 
-- ip-api.com batch reputation enrichment with persistent per-subnet cache.
+- Subnet-aggregation behavioral scoring (`/24` IPv4 / `/64` IPv6).
+- Five signals: UA diversity, target-path concentration, top-3 URL
+  concentration, referer rate, ip-api.com hosting/proxy/mobile reputation.
+- ip-api.com batch enrichment with persistent per-subnet cache; offline ASN
+  keyword matching as fallback when ip-api is unreachable.
 - AI-bot whitelist generator (OpenAI ChatGPT-User, GPTBot, OAI-SearchBot,
   Anthropic ClaudeBot) via `scripts/refresh-ai-whitelist.sh`.
-- Offline ASN keyword matching as fallback when ip-api is unreachable.
+- Cron-driven; default threshold ≥7/11; default TTL 7 days.
+- MIT license; README, CONTRIBUTING, SECURITY, issue/PR templates.
 
-### Changed
-
-- Project renamed for open-source release (was `ytg-autoblock`).
-- MIT license; full README, CONTRIBUTING, SECURITY, issue/PR templates added.
-
-## [v1.0] - 2026-05-11
-
-Initial release: subnet-aggregation behavioral scoring (UA diversity, target
-paths, top-3 concentration, referer rate, ASN keyword). Designed for
-CDN-fronted sites where per-IP rate limiting misses distributed crawls inside
-a single /24.
+Designed for CDN-fronted sites where per-IP rate limiting misses distributed
+crawls within a single /24.

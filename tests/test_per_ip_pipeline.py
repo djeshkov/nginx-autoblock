@@ -8,8 +8,8 @@ SAMPLE_LOG = textwrap.dedent("""\
     1.2.3.4 - - [15/May/2026:08:30:02 +0000] "GET /reservation/def HTTP/2.0" 200 12345 "-" "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0.0.0 Safari/537.36"
     1.2.3.4 - - [15/May/2026:08:30:03 +0000] "GET /reservation/ghi HTTP/2.0" 200 12345 "-" "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0.0.0 Safari/537.36"
     5.6.7.8 - - [15/May/2026:08:30:02 +0000] "GET / HTTP/2.0" 200 5000 "https://google.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36"
-    5.6.7.8 - - [15/May/2026:08:30:03 +0000] "GET /app.js HTTP/2.0" 200 80000 "https://youngtalentsgroup.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36"
-    5.6.7.8 - - [15/May/2026:08:30:04 +0000] "GET /style.css HTTP/2.0" 200 20000 "https://youngtalentsgroup.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36"
+    5.6.7.8 - - [15/May/2026:08:30:03 +0000] "GET /app.js HTTP/2.0" 200 80000 "https://example.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36"
+    5.6.7.8 - - [15/May/2026:08:30:04 +0000] "GET /style.css HTTP/2.0" 200 20000 "https://example.com/" "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/148.0.0.0 Safari/537.36"
     66.249.66.1 - - [15/May/2026:08:30:05 +0000] "GET /tournaments/spain HTTP/2.0" 200 8000 "-" "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
     """)
 
@@ -17,7 +17,7 @@ SAMPLE_LOG = textwrap.dedent("""\
 def test_scan_log_per_ip_aggregates_correctly(autoblock_mod, tmp_path):
     log_path = tmp_path / "access.log"
     log_path.write_text(SAMPLE_LOG)
-    cfg = {"access_log": str(log_path), "internal_ref_hosts": ["youngtalentsgroup.com"]}
+    cfg = {"access_log": str(log_path), "internal_ref_hosts": ["example.com"]}
     stats = autoblock_mod.scan_log_per_ip(cfg, window_start=None)
     # 1.2.3.4 made 1 request, 5.6.7.8 made 3, googlebot 1
     assert stats["1.2.3.4"]["reqs"] == 3
@@ -33,7 +33,7 @@ def test_find_blockable_ips_returns_scrapers_only(autoblock_mod, tmp_path):
     cfg = {
         "access_log":            str(log_path),
         "per_ip_threshold":      6,
-        "internal_ref_hosts":    ["youngtalentsgroup.com"],
+        "internal_ref_hosts":    ["example.com"],
         "self_ips":              [],
     }
     # Stub ASN lookup — pretend 1.2.3.4 is from a cloud
@@ -53,7 +53,7 @@ def test_self_ips_skipped(autoblock_mod, tmp_path):
     cfg = {
         "access_log":            str(log_path),
         "per_ip_threshold":      6,
-        "internal_ref_hosts":    ["youngtalentsgroup.com"],
+        "internal_ref_hosts":    ["example.com"],
         "self_ips":              ["1.2.3.4"],  # mark as self
     }
     blockable = autoblock_mod.find_blockable_ips(

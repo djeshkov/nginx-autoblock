@@ -3,28 +3,28 @@
 Behavioral autoblocker for Nginx. Detects bot crawlers by **composite scoring** across multiple signals (UA diversity, request patterns, IP reputation, behavioral fingerprint) and adds offending **subnets and individual IPs** to nginx's block-list with TTL.
 
 Designed for two threat classes that per-IP rate-limiting (`limit_req_zone $binary_remote_addr`) misses:
-- **Concentrated botnets** — same /24 producing 100+ req/h, each IP individually below per-IP limits (v5 subnet pass).
-- **Distributed scraping** — hundreds of cloud IPs from many ASNs, 1-2 requests each, mass-scraping public URLs harvested from sitemaps or tournament/product pages (v6 per-IP pass, opt-in).
+- **Concentrated botnets** — same /24 producing 100+ req/h, each IP individually below per-IP limits (subnet pass, default).
+- **Distributed scraping** — hundreds of cloud IPs from many ASNs, 1-2 requests each, mass-scraping public URLs harvested from sitemaps or tournament/product pages (per-IP pass, opt-in since v1.1).
 
 ```
                 ┌─────────────────────────────────────────────────┐
    nginx logs ──┤  autoblock (every 10 min via cron)              │
                 │                                                 │
-                │   v5 subnet pass (default):                     │
+                │   Subnet pass (default):                        │
                 │     group requests by /24 or /64                │
                 │     score 0-11 against 5 behavioral signals     │
                 │     enrich via ip-api.com (free)                │
                 │     block /24 if score ≥ 7                      │
                 │                                                 │
-                │   v6 per-IP pass (opt-in):                      │
+                │   Per-IP pass (opt-in since v1.1):              │
                 │     score each IP 0-14 (path-agnostic)          │
                 │     catches distributed scrapers (1 req/IP)     │
                 │     block /32 if score ≥ 9                      │
                 └────────────────┬────────────────────────────────┘
                                  │
                                  ▼
-                 /etc/nginx/blocked-subnets.conf   (v5)
-                 /etc/nginx/blocked-ips.conf       (v6)
+                 /etc/nginx/blocked-subnets.conf   (subnet pass)
+                 /etc/nginx/blocked-ips.conf       (per-IP pass)
                                  │
                                  ▼
                        nginx returns 444 to bot
@@ -65,9 +65,9 @@ For each `/24` (IPv4) or `/64` (IPv6) seen in the last 30 minutes, score against
 
 **ip-api.com batch enrichment** queries up to 100 IPs in one HTTP request, free, no signup. Results cached for 7 days per subnet. Falls back to offline ASN keyword matching (via `iptoasn.com` database) if the API is unreachable.
 
-## v6 — Per-IP scoring (distributed scraping)
+## Per-IP scoring (distributed scraping)
 
-The subnet pass has an architectural limit: when bot operators spread requests across **many cloud IPs, 1-2 requests each**, no /24 accumulates enough volume to trip. v6 adds a second, **opt-in** pass that scores each IP on its own behavioral fingerprint.
+The subnet pass has an architectural limit: when bot operators spread requests across **many cloud IPs, 1-2 requests each**, no /24 accumulates enough volume to trip. Since **v1.1**, an opt-in second pass scores each IP on its own behavioral fingerprint.
 
 ```ini
 # /etc/nginx-autoblock/config.env
@@ -107,11 +107,11 @@ The first 3 path-volume signals (noassets/noref/upath) require multiple requests
 
 ### When to enable
 
-Enable v6 when you observe **either**:
+Enable the per-IP pass when you observe **either**:
 - Your access log shows many distinct cloud IPs each hitting one specific endpoint (e.g., `/reservation/<UUID>`, `/product/<ID>`, `/profile/<USER>`) once each.
-- Session-recording or analytics tools show short bot-like sessions (< 5s, 0 clicks) from many countries / IPs — but `--show-scores` (v5 subnet pass) finds nothing because no /24 is hot enough.
+- Session-recording or analytics tools show short bot-like sessions (< 5s, 0 clicks) from many countries / IPs — but `--show-scores` (the subnet pass) finds nothing because no /24 is hot enough.
 
-Backtest details and signal calibration: [docs/SCORING.md § v6](docs/SCORING.md#v6--per-ip-pass-opt-in).
+Backtest details and signal calibration: [docs/SCORING.md § Per-IP pass](docs/SCORING.md#per-ip-pass-opt-in).
 
 ## Quick install
 
@@ -231,9 +231,9 @@ Manual entries (lines without an `# auto added=...` comment) are **never** touch
 
 - **Microsoft Azure as a whole** is NOT flagged as hosting by default. This is intentional — many legitimate AI bots (ChatGPT-User, GPTBot) live on Azure, and we'd rather let them through than block ChatGPT. The trade-off: less-known bots from generic Azure subnets are caught only if `ip-api` flags them specifically.
 
-- **Single Cloudflare-fronted setup tested.** The static-ratio caveat assumes a CDN cache in front. For direct-to-origin nginx, you might benefit from re-adding a static-asset-ratio signal — or enable the v6 per-IP pass which uses asset-ratio at the individual-IP level.
+- **Single Cloudflare-fronted setup tested.** The static-ratio caveat assumes a CDN cache in front. For direct-to-origin nginx, you might benefit from re-adding a static-asset-ratio signal — or enable the per-IP pass which uses asset-ratio at the individual-IP level.
 
-- **Per-IP pass (v6) trusts claimed-bot UAs without PTR verification** in v6.0. If a scraper spoofs `Googlebot` in its User-Agent, the v6 pass currently skips it. Full PTR + forward-DNS verification is implementation-ready and tracked for v6.1. Until then, the v5 subnet pass still catches concentrated spoofers, and the UA whitelist for AI bots is separately verified via published IP ranges (`scripts/refresh-ai-whitelist.sh`).
+- **Per-IP pass trusts claimed-bot UAs without PTR verification** as of v1.1. If a scraper spoofs `Googlebot` in its User-Agent, the per-IP pass currently skips it. Full PTR + forward-DNS verification is implementation-ready and tracked for v1.2. Until then, the subnet pass still catches concentrated spoofers, and the UA whitelist for AI bots is separately verified via published IP ranges (`scripts/refresh-ai-whitelist.sh`).
 
 ## Data sources
 

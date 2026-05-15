@@ -67,16 +67,18 @@ DEFAULTS = {
     "ipapi_batch_url":  "http://ip-api.com/batch?fields=query,proxy,hosting,mobile,isp,as,country",
     "ipapi_timeout":    10,
     "ipapi_batch_size": 100,
-    # ─── v6: Per-IP behavioral scoring (path-agnostic) ─────────────
+    # ─── Per-IP behavioral scoring (path-agnostic, added in v1.1) ──
     # Disabled by default for backward compatibility. Enable when you want to
     # catch distributed scrapers (1 req per IP from many cloud IPs) that the
-    # /24 subnet pass cannot detect by design.
+    # subnet pass cannot detect by design.
     "per_ip_enabled":            "false",
     # Output file for per-IP /32 bans. Separate from blocked_conf so the
     # subnet pass output remains untouched.
     "blocked_ips_conf":          "/etc/nginx/blocked-ips.conf",
-    # Score threshold (max ~14). Backtest on 116k log lines (YTG, 48h):
-    # threshold=9 → 395 IPs, 0% FP after UA whitelist. Lower = more aggressive.
+    # Score threshold (max ~14). On reference traffic (a Laravel site, ~116k
+    # log lines / 25k unique IPs over 48h) threshold=9 yielded ~1.5% of IPs
+    # flagged with 0% false-positive rate after UA whitelist. Lower = more
+    # aggressive but requires careful whitelist tuning.
     "per_ip_threshold":          9,
     # TTL for per-IP auto-bans (independent from subnet TTL).
     "per_ip_ttl_days":           7,
@@ -120,7 +122,7 @@ def load_config(path):
     cfg["use_ipapi"]           = str(cfg["use_ipapi"]).lower() in ("true", "1", "yes", "on")
     cfg["target_paths"]   = [p.strip() for p in cfg["target_paths"].split(",") if p.strip()]
     cfg["excluded_paths"] = [p.strip() for p in cfg["excluded_paths"].split(",") if p.strip()]
-    # v6 additions
+    # Per-IP pass settings (added v1.1)
     cfg["per_ip_enabled"] = str(cfg["per_ip_enabled"]).lower() in ("true", "1", "yes", "on")
     cfg["per_ip_threshold"]          = int(cfg["per_ip_threshold"])
     cfg["per_ip_ttl_days"]           = int(cfg["per_ip_ttl_days"])
@@ -169,7 +171,6 @@ AUTO_END_MARKER   = "# === AUTOBLOCK AUTO SECTION END ==="
 _LEGACY_AUTO_HEADERS = {
     "# Auto-added by autoblock — DO NOT EDIT manually",
     "# Auto-added by nginx-autoblock — DO NOT EDIT manually",
-    "# Auto-added by ytg-autoblock — DO NOT EDIT manually",
     "# To unblock: remove the line + sudo nginx -s reload",
 }
 
@@ -247,16 +248,17 @@ def is_hosting_asn(desc):
 
 
 # ─────────────────────────────────────────────────────────────────
-# v6: Per-IP behavioral scoring — path-agnostic, works with N=1 request
+# Per-IP behavioral scoring — path-agnostic, works with N=1 request
+# (Added in v1.1.)
 #
 # This is an additive pass that runs ALONGSIDE the existing /24 subnet
-# aggregation (v5). Subnet pass catches concentrated botnets; per-IP pass
+# aggregation. Subnet pass catches concentrated botnets; per-IP pass
 # catches distributed scrapers where each IP makes 1-2 requests and no /24
 # accumulates enough traffic to trip.
 #
 # Disabled by default (per_ip_enabled=false). When enabled, output goes to
-# a SEPARATE file (blocked_ips_conf) at /32 granularity, leaving the v5
-# subnet output untouched.
+# a SEPARATE file (blocked_ips_conf) at /32 granularity, leaving the
+# subnet-pass output untouched.
 
 # UA max length stored per-IP. Googlebot Mobile UA is ~198 chars; truncating
 # below that loses the "Googlebot/2.1" suffix and breaks claimed-bot detection.
@@ -415,7 +417,7 @@ def scan_log_per_ip(cfg, window_start=None):
 
 
 def find_blockable_ips(cfg, asn_lookup_fn, window_start=None):
-    """Run the v6 per-IP pass: returns list of {ip, score, reasons, added, expires}.
+    """Run the per-IP behavioral pass: returns list of {ip, score, reasons, added, expires}.
 
     `asn_lookup_fn`: callable (ip_str) -> asn_description_str. Pass a closure
     that captures the asn_db, e.g. lambda ip: asn_lookup(ipaddress.ip_network(ip+"/32"), db).
@@ -491,11 +493,12 @@ def score_ip(stats, asn_desc, cfg):
     `cfg` may carry per-signal tuning (per_ip_chrome_min_version, etc.). Empty
     dict accepts all defaults.
 
-    Backtest on 116k log lines / 25k IPs (YTG, 48h):
-        - threshold=9 → 395 IPs to ban
+    Reference backtest on ~116k log lines / 25k IPs from a Laravel-fronted
+    site over 48h:
+        - threshold=9 → ~395 IPs flagged (~1.5% of seen IPs)
         - 69% confirmed hosting by ip-api, 26% proxy
         - 0% false-positive rate after UA whitelist
-        - catches 9% of residential scrapers that ip-api misses
+        - catches ~9% of residential scrapers that ip-api alone misses
     """
     n = stats.get("reqs", 0)
     if n == 0:
@@ -1027,7 +1030,7 @@ def cmd_cleanup(cfg):
     now = datetime.now(timezone.utc)
     any_changed = False
 
-    # Cleanup subnet bans (v5)
+    # Cleanup both block files (subnet + per-IP if enabled)
     for path_key, label in [("blocked_conf", "subnet"), ("blocked_ips_conf", "per-IP")]:
         path = cfg.get(path_key)
         if not path or not Path(path).exists():
@@ -1068,7 +1071,7 @@ def cmd_cleanup(cfg):
 
 
 def cmd_per_ip(cfg, dry_run=False, show_only=False):
-    """v6 — Per-IP behavioral scoring pass.
+    """Per-IP behavioral scoring pass (added v1.1).
 
     Independent from the subnet pass. Writes to `blocked_ips_conf` (separate
     file). Can be run standalone via --per-ip, or auto-runs after subnet pass
@@ -1162,11 +1165,11 @@ def main():
     p = argparse.ArgumentParser(description="nginx-autoblock — behavioral autoblocker for Nginx")
     p.add_argument("--config", default=DEFAULT_CONFIG_PATH, help=f"Config file (default: {DEFAULT_CONFIG_PATH})")
     p.add_argument("--dry-run", action="store_true", help="Show candidates without writing")
-    p.add_argument("--show-scores", action="store_true", help="Show top-30 subnets with scores (v5 subnet pass)")
+    p.add_argument("--show-scores", action="store_true", help="Show top-30 subnets with scores (subnet pass)")
     p.add_argument("--show-per-ip", action="store_true",
-                   help="Show top-50 per-IP candidates (v6 path-agnostic pass; diagnostic)")
+                   help="Show top-50 per-IP candidates (path-agnostic pass; diagnostic)")
     p.add_argument("--per-ip", action="store_true",
-                   help="Run ONLY the v6 per-IP pass (skip subnet pass)")
+                   help="Run ONLY the per-IP pass (skip subnet pass)")
     p.add_argument("--cleanup", action="store_true", help="Remove expired auto-bans (both subnet and per-IP)")
     args = p.parse_args()
 

@@ -5,8 +5,8 @@ target threat classes:
 
 | Pass | Aggregation | Threat class | Default state |
 |------|-------------|--------------|---------------|
-| **v5 subnet** | `/24` (IPv4) / `/64` (IPv6) | Concentrated botnets — same /24 produces 100+ req/h | Enabled |
-| **v6 per-IP** | `/32` per individual IP | Distributed scraping — many IPs, 1-2 req each | Opt-in (`per_ip_enabled=true`) |
+| **Subnet pass** | `/24` (IPv4) / `/64` (IPv6) | Concentrated botnets — same /24 produces 100+ req/h | Enabled |
+| **Per-IP pass** | `/32` per individual IP | Distributed scraping — many IPs, 1-2 req each | Opt-in (`per_ip_enabled=true`, added v1.1) |
 
 The passes run independently and write to **separate** files
 (`blocked-subnets.conf` and `blocked-ips.conf`). Use whichever combination fits
@@ -14,7 +14,7 @@ your threat profile.
 
 ---
 
-# v5 — Subnet pass (default)
+# Subnet pass (default)
 
 Each subnet (`/24` for IPv4, `/64` for IPv6) is scored across these signals. Total ranges 0-11; default block threshold is 7.
 
@@ -125,17 +125,17 @@ Score (if NOT whitelisted):
 - **Bots get blocked but you want to allow them** (e.g., SEO crawlers you actually use): add their CIDR or ASN range to the whitelist.
 - **One signal is too aggressive on your traffic:** customize `target_paths` (most-tuned setting in practice — depends entirely on your application).
 
-## Why static-asset ratio is NOT a signal (v5 only)
+## Why static-asset ratio is NOT a signal (subnet pass)
 
 Earlier subnet-pass versions used "static-ratio < 10% → +3" (real browsers download CSS/JS/images, bots don't). This is **broken behind a CDN**.
 
 When Cloudflare (or any CDN with static caching) sits in front of nginx, static files are served from edge cache — the origin nginx sees only ~5% static traffic for everyone. Real users and bots both look like 0-5% static at origin. The signal fires on both, providing no discrimination.
 
-The v6 per-IP pass re-introduces this signal because it operates per-IP at a finer granularity — see below.
+The per-IP pass re-introduces this signal because it operates per-IP at a finer granularity — see below.
 
 ---
 
-# v6 — Per-IP pass (opt-in)
+# Per-IP pass (opt-in)
 
 The subnet pass has an architectural limit: it cannot detect **distributed
 scraping** where 200 individual cloud IPs each make 1 request. No /24
@@ -155,7 +155,7 @@ unique-paths, 4xx-probing). Score range 0-14; default threshold 9.
 | 3 | **extref** | External-referer ratio > 50% (of referers present) | +1 | has-ref ≥ 3 | Coming exclusively from external sites is a scraping pattern (target list from a 3rd-party source). |
 | 4 | **4xx** | 4xx-response ratio > 30% | +1 | N ≥ 5 | Scanners hit non-existent paths probing for vulnerabilities. |
 | 5 | **upath** | Unique-paths ratio ≥ 95% | +2 | N ≥ 5 | Classic crawler pattern — every request a different URL. |
-| 6 | **cloud** | ASN description matches hosting/cloud keywords | +3 | — | Real users come from ISP, not datacenter. Reuses the same keyword list as the v5 ASN fallback. |
+| 6 | **cloud** | ASN description matches hosting/cloud keywords | +3 | — | Real users come from ISP, not datacenter. Reuses the same keyword list as the subnet-pass ASN fallback. |
 | 7 | **ua:oldchrome** | Chrome major version < `per_ip_chrome_min_version` (default 142, ~6mo behind current) | +2 | — | Real users auto-update Chrome. Scrapers pin old versions (116, 120, 133 are common). |
 | 7 | **ua:headless** | UA matches HeadlessChrome / Puppeteer / Playwright / Selenium / Scrapy / python-requests / Go-http-client / etc. | +3 | — | Direct self-identification. |
 | 7 | **ua:short/empty** | UA length < 20 or UA is "-" | +2 | — | Real browsers have long UAs; bots sometimes set placeholder or omit. |
@@ -172,7 +172,7 @@ Three whitelist layers run before scoring:
    - `imgix/`, `Pingdom`, `UptimeRobot`, `StatusCake`, `Site24x7` (monitoring / CDN image fetchers)
 3. **Claimed-bot UA** — built-in regex matches well-known crawler UAs: Googlebot, bingbot, YandexBot, AhrefsBot, DuckDuckBot, Amzn-SearchBot, Amazonbot, Applebot, FacebookBot, meta-externalagent, Sogou web spider, YisouSpider, Bytespider, PetalBot, baiduspider, SemrushBot, MJ12bot, DataForSeoBot, MojeekBot, BLEXBot, GoogleOther, CCBot, ClaudeBot, GPTBot, ChatGPT-User, PerplexityBot, Twitterbot, TelegramBot, etc.
 
-The script ships PTR-suffix mappings for the claimed-bot list (e.g., Googlebot → `.googlebot.com`, `.google.com`). Full PTR + forward-DNS verification is **implementation-ready but not wired in v6.0** — claimed bots are held aside without verification. If a fake-bot UA spoofs Googlebot, this version will skip it. PTR verification can be added by uncommenting `verify_ptr` helpers in `autoblock` and gating `is_claimed_bot` on a passing PTR check; tracked for v6.1.
+The script ships PTR-suffix mappings for the claimed-bot list (e.g., Googlebot → `.googlebot.com`, `.google.com`). Full PTR + forward-DNS verification is **implementation-ready but not wired as of v1.1** — claimed bots are held aside without verification. If a fake-bot UA spoofs Googlebot, this version will skip it. PTR verification can be added by uncommenting `verify_ptr` helpers in `autoblock` and gating `is_claimed_bot` on a passing PTR check; tracked for v1.2.
 
 ## Calibration examples
 
@@ -211,7 +211,7 @@ Score:
   TOTAL                       → 10  → BLOCK
 ```
 
-The Baidu Netcom example: real production hit, 30+ IPs from this /24 scored 12-13 each in a 48h window — the v6 pass catches every individual IP with full evidence trail.
+The Baidu Netcom example: real production hit, 30+ IPs from this /24 scored 12-13 each in a 48h window — the per-IP pass catches every individual IP with full evidence trail.
 
 ### Real user: Mac Chrome 148, internal navigation
 
