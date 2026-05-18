@@ -111,3 +111,80 @@ def test_hosting_ratio_computes_fraction_on_cloud_asn(autoblock_mod):
     }
     ratio = autoblock_mod.hosting_ratio_for_ips(ips, lambda ip: asn_map.get(ip, ""))
     assert abs(ratio - 0.75) < 0.01
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Hosting-ratio gate (v1.2.1)
+#
+# Behind a CDN, static assets are edge-cached — the origin sees ~0% asset
+# ratio for every client, bots and real users alike. The `noassets` signal
+# therefore fires on real-user clusters too. A behaviorally-scored but
+# residential (low-hosting) cluster must NOT be blockable: hosting-ASN ratio
+# is the discriminator that survives a CDN. The gate enforces a hosting-ratio
+# floor (ua_cluster_min_hosting) below which a cluster is never blocked,
+# regardless of behavioral score.
+
+def _write_ua_cluster_log(path, ua, n_ips, ip_prefix):
+    """Write n_ips distinct IPs, each making one bot-like request (no asset,
+    no referer) under the same UA."""
+    lines = []
+    for i in range(1, n_ips + 1):
+        lines.append(
+            f'{ip_prefix}.{i} - - [18/May/2026:19:31:{i % 60:02d} +0000] '
+            f'"GET /catalog/item-{i} HTTP/2.0" 200 5000 "-" "{ua}"'
+        )
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_hosting_gate_blocks_residential_cluster(autoblock_mod, tmp_path):
+    """A behaviorally bot-like cluster that is 0% hosting (residential — e.g.
+    real users whose assets are CDN-cached) must be gated out."""
+    log = tmp_path / "access.log"
+    _write_ua_cluster_log(log, "Mozilla/5.0 (Macintosh) Chrome/120.0.0.0", 40, "10.0.0")
+    cfg = {
+        "access_log":            str(log),
+        "ua_cluster_min_ips":    30,
+        "ua_cluster_threshold":  7,
+        "ua_cluster_ttl_days":   7,
+        "ua_cluster_min_hosting": 0.5,
+        "self_ips":              [],
+    }
+    clusters = autoblock_mod.find_blockable_ua_clusters(
+        cfg, asn_lookup_fn=lambda ip: "Vodafone Espana", window_start=None)
+    assert clusters == [], "residential cluster (0% hosting) must be gated out"
+
+
+def test_hosting_gate_allows_hosting_cluster(autoblock_mod, tmp_path):
+    """The same bot-like cluster, but on hosting ASNs, passes the gate."""
+    log = tmp_path / "access.log"
+    _write_ua_cluster_log(log, "Mozilla/5.0 (Macintosh) Chrome/120.0.0.0", 40, "10.0.0")
+    cfg = {
+        "access_log":            str(log),
+        "ua_cluster_min_ips":    30,
+        "ua_cluster_threshold":  7,
+        "ua_cluster_ttl_days":   7,
+        "ua_cluster_min_hosting": 0.5,
+        "self_ips":              [],
+    }
+    clusters = autoblock_mod.find_blockable_ua_clusters(
+        cfg, asn_lookup_fn=lambda ip: "DIGITALOCEAN-ASN, US", window_start=None)
+    assert len(clusters) == 1, "hosting cluster must pass the gate"
+    assert clusters[0]["ip_count"] == 40
+
+
+def test_hosting_gate_disabled_when_min_hosting_zero(autoblock_mod, tmp_path):
+    """ua_cluster_min_hosting=0 disables the gate — for non-CDN sites where
+    the behavioral signals are valid on their own."""
+    log = tmp_path / "access.log"
+    _write_ua_cluster_log(log, "Mozilla/5.0 (Macintosh) Chrome/120.0.0.0", 40, "10.0.0")
+    cfg = {
+        "access_log":            str(log),
+        "ua_cluster_min_ips":    30,
+        "ua_cluster_threshold":  7,
+        "ua_cluster_ttl_days":   7,
+        "ua_cluster_min_hosting": 0.0,
+        "self_ips":              [],
+    }
+    clusters = autoblock_mod.find_blockable_ua_clusters(
+        cfg, asn_lookup_fn=lambda ip: "Vodafone Espana", window_start=None)
+    assert len(clusters) == 1, "gate disabled — residential cluster scored on behavior"

@@ -298,6 +298,33 @@ Hosting-ASN classification uses the offline `iptoasn.com` ASN DB only — not
 ip-api.com. A cluster can contain hundreds of IPs; ip-api's 45 req/min limit
 makes it unsuitable here, and the local ASN keyword match is enough.
 
+## Hosting-ratio gate (added v1.2.1)
+
+Before a cluster's score is even considered, it must clear a **hosting-ratio
+floor** — `ua_cluster_min_hosting`, default `0.5`. A cluster whose member IPs
+are less than that fraction on hosting/datacenter ASNs is **never blocked**,
+regardless of behavioral score.
+
+The reason is the same CDN problem the subnet pass calls out for static-asset
+ratio. Behind a CDN, CSS / JS / images are served from the edge cache — the
+origin sees ~0% asset ratio for **every** client, real users included. So the
+`noassets` signal (+3) fires on real-user clusters too. A cluster of real
+users on an older browser version can reach the score threshold on
+`noassets` + `noref` + `ua:oldchrome` alone — **with no hosting signal at
+all**. Without the gate, that cluster would be blocked: hundreds of real-user
+IPs.
+
+The gate makes hosting-ASN ratio a *necessary* condition. Behind a CDN it is
+the only signal that reliably separates a botnet from a popular browser, so
+requiring it is correct. On an origin that is **not** behind a CDN, the
+behavioral signals are valid on their own — set `ua_cluster_min_hosting=0` to
+disable the gate there.
+
+Tuning: `0.5` means "a botnet cluster must be majority hosting infrastructure".
+Raising toward `0.7`-`0.8` blocks only overwhelmingly-hosting clusters, which
+shrinks the residential blast radius — when a cluster is flagged, *all* its
+member IPs are blocked, including any residential minority.
+
 ## Calibration example — the May 2026 distributed-scraping incident
 
 ```
@@ -340,6 +367,9 @@ removed from a cluster's IP set before the `ua_cluster_min_ips` gate.
   hosting-dominant *and* behaviorally bot-like. Lowering toward 4-5 would let
   a hosting-only or behavior-only cluster through; raising toward 9 requires
   almost every signal.
+- **`ua_cluster_min_hosting`** (default 0.5) — hosting-ratio gate, see the
+  section above. Raise toward 0.7-0.8 on CDN-fronted origins to shrink the
+  residential blast radius; set 0 only if the origin is not behind a CDN.
 - **Architectural limit:** this pass is still cron-driven — it detects a
   botnet after the fact and blocks the IPs it already saw. A rotating botnet
   brings fresh IPs on its next wave. Catching the cluster *during* the first

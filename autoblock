@@ -110,6 +110,13 @@ DEFAULTS = {
     "ua_cluster_threshold":    7,
     # TTL for UA-cluster auto-bans (independent from the other passes).
     "ua_cluster_ttl_days":     7,
+    # Hosting-ratio floor (0.0-1.0). A cluster whose member IPs are less than
+    # this fraction on hosting/datacenter ASNs is NEVER blocked, regardless of
+    # behavioral score. Behind a CDN, static assets are edge-cached so the
+    # `noassets` signal fires on real-user clusters too — hosting-ASN ratio is
+    # the discriminator that survives a CDN. Set 0 to disable the gate (only
+    # safe for origins NOT behind a CDN). Added v1.2.1.
+    "ua_cluster_min_hosting":  0.5,
 }
 
 DEFAULT_CONFIG_PATH = "/etc/nginx-autoblock/config.env"
@@ -152,6 +159,7 @@ def load_config(path):
     cfg["ua_cluster_min_ips"]   = int(cfg["ua_cluster_min_ips"])
     cfg["ua_cluster_threshold"] = int(cfg["ua_cluster_threshold"])
     cfg["ua_cluster_ttl_days"]  = int(cfg["ua_cluster_ttl_days"])
+    cfg["ua_cluster_min_hosting"] = float(cfg["ua_cluster_min_hosting"])
     return cfg
 
 
@@ -729,13 +737,16 @@ def find_blockable_ua_clusters(cfg, asn_lookup_fn, window_start=None):
 
     A cluster is a User-Agent shared across >= ua_cluster_min_ips distinct IPs.
     Whitelisted and claimed-bot UAs are skipped (same whitelists as the per-IP
-    pass). The member IPs of a cluster scoring >= ua_cluster_threshold are
+    pass). A cluster below the ua_cluster_min_hosting hosting-ratio floor is
+    gated out regardless of behavioral score (see the gate note below). The
+    member IPs of a remaining cluster scoring >= ua_cluster_threshold are
     returned for blocking.
     """
-    min_ips   = int(cfg.get("ua_cluster_min_ips", 30))
-    threshold = int(cfg.get("ua_cluster_threshold", 7))
-    ttl_days  = int(cfg.get("ua_cluster_ttl_days", 7))
-    self_ips  = set(cfg.get("self_ips", []) or [])
+    min_ips     = int(cfg.get("ua_cluster_min_ips", 30))
+    threshold   = int(cfg.get("ua_cluster_threshold", 7))
+    ttl_days    = int(cfg.get("ua_cluster_ttl_days", 7))
+    min_hosting = float(cfg.get("ua_cluster_min_hosting", 0.5))
+    self_ips    = set(cfg.get("self_ips", []) or [])
 
     now = datetime.now(timezone.utc)
     added_str   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -753,6 +764,14 @@ def find_blockable_ua_clusters(cfg, asn_lookup_fn, window_start=None):
             # Claimed bots are held aside, same as the per-IP pass.
             continue
         hosting_ratio = hosting_ratio_for_ips(ips, asn_lookup_fn)
+        # Hosting-ratio gate. Behind a CDN, static assets are edge-cached, so
+        # the `noassets` behavioral signal fires on real-user clusters too — a
+        # residential cluster can reach the score threshold on CDN artifacts.
+        # Hosting-ASN ratio is the discriminator that survives a CDN: a cluster
+        # below the floor is never blocked. Set ua_cluster_min_hosting=0 to
+        # disable (only for origins NOT behind a CDN).
+        if hosting_ratio < min_hosting:
+            continue
         sc, sigs = score_ua_cluster(
             {"ua": ua, "reqs": s["reqs"], "assets": s["assets"],
              "no_ref": s["no_ref"], "status_4xx": s["status_4xx"]},
