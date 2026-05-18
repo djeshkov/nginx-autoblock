@@ -92,6 +92,24 @@ DEFAULTS = {
     # Chrome version below which UA is considered scraper-like (~6mo behind
     # current stable). Update periodically or set 0 to disable.
     "per_ip_chrome_min_version": 142,
+    # ─── UA-cluster pass (path-agnostic, added in v1.2) ────────────
+    # Groups requests by User-Agent and flags a UA shared across an abnormal
+    # number of distinct IPs when the cluster sits on hosting/datacenter infra
+    # and behaves like a bot (no assets, no referers). Catches distributed
+    # scraping botnets that defeat the subnet and per-IP passes by design —
+    # hundreds of IPs, ~1 request each, all rotating a tiny pool of UAs.
+    # Disabled by default for backward compatibility.
+    "ua_cluster_enabled":      "false",
+    # Output file for UA-cluster /32 bans. Separate from the other passes so
+    # each pass's output stays independently manageable.
+    "blocked_ua_cluster_conf": "/etc/nginx/blocked-ua-clusters.conf",
+    # Minimum distinct IPs sharing one UA before the cluster is evaluated.
+    # Below this, a UA is too small to be a meaningful cluster.
+    "ua_cluster_min_ips":      30,
+    # Cluster score threshold (max 13). See docs/SCORING.md.
+    "ua_cluster_threshold":    7,
+    # TTL for UA-cluster auto-bans (independent from the other passes).
+    "ua_cluster_ttl_days":     7,
 }
 
 DEFAULT_CONFIG_PATH = "/etc/nginx-autoblock/config.env"
@@ -129,6 +147,11 @@ def load_config(path):
     cfg["per_ip_chrome_min_version"] = int(cfg["per_ip_chrome_min_version"])
     cfg["internal_ref_hosts"] = [h.strip() for h in str(cfg["internal_ref_hosts"]).split(",") if h.strip()]
     cfg["self_ips"]           = [h.strip() for h in str(cfg["self_ips"]).split(",") if h.strip()]
+    # UA-cluster pass settings (added v1.2)
+    cfg["ua_cluster_enabled"]   = str(cfg["ua_cluster_enabled"]).lower() in ("true", "1", "yes", "on")
+    cfg["ua_cluster_min_ips"]   = int(cfg["ua_cluster_min_ips"])
+    cfg["ua_cluster_threshold"] = int(cfg["ua_cluster_threshold"])
+    cfg["ua_cluster_ttl_days"]  = int(cfg["ua_cluster_ttl_days"])
     return cfg
 
 
@@ -566,6 +589,188 @@ def score_ip(stats, asn_desc, cfg):
         sigs.append("ua:" + ",".join(sorted(set(ua_flags))))
 
     return pts, sigs
+
+
+# ─────────────────────────────────────────────────────────────────
+# UA-cluster scoring — aggregate by User-Agent, score the cluster
+# (Added in v1.2.)
+#
+# The subnet pass scores /24s; the per-IP pass scores /32s. Both score IPs in
+# isolation, so a distributed scraping botnet defeats both by design — hundreds
+# of IPs, ~1 request each, every IP individually innocent.
+#
+# But such a botnet shares a tiny pool of User-Agent strings across its whole
+# IP fleet. That sharing is an AGGREGATE property — invisible to any per-IP
+# scorer. The UA-cluster pass groups requests by UA and scores the cluster.
+#
+# A genuinely popular real-browser UA is also shared by many IPs — but those
+# IPs are residential and behave normally, so the cluster scores low. The
+# discriminators are hosting-ASN ratio and behavior, NOT raw IP count.
+#
+# Disabled by default (ua_cluster_enabled=false). Output goes to a SEPARATE
+# file (blocked_ua_cluster_conf) at /32 granularity.
+
+def hosting_ratio_for_ips(ips, asn_lookup_fn):
+    """Fraction (0.0-1.0) of IPs whose ASN description matches a hosting/cloud
+    keyword. `asn_lookup_fn` maps ip_str -> asn_description_str."""
+    ips = list(ips)
+    if not ips:
+        return 0.0
+    hosting = sum(1 for ip in ips if is_hosting_asn(asn_lookup_fn(ip)))
+    return hosting / len(ips)
+
+
+def score_ua_cluster(stats, hosting_ratio, cfg):
+    """Score a UA-cluster — a User-Agent shared across many distinct IPs.
+
+    `stats` carries cluster-wide aggregates: ua, reqs, assets, no_ref,
+    status_4xx. IP count is NOT scored here — it does not discriminate a
+    botnet from a popular browser; it only gates which UAs reach this function
+    (see find_blockable_ua_clusters).
+
+    `hosting_ratio` is the fraction of cluster member IPs on a hosting/cloud
+    ASN, computed by the caller via hosting_ratio_for_ips().
+
+    Returns (score, signals_list). Max 13; default block threshold 7.
+    """
+    n = stats.get("reqs", 0)
+    if n == 0:
+        return 0, []
+
+    chrome_min = cfg.get("per_ip_chrome_min_version", SUSPICIOUS_CHROME_THRESHOLD)
+    pts = 0
+    sigs = []
+
+    # S1 — hosting-ASN ratio: a popular real UA spreads across residential
+    # ISPs; a botnet fleet sits on datacenter / proxy infrastructure.
+    if hosting_ratio >= 0.5:
+        pts += 2
+        sigs.append(f"host{int(hosting_ratio * 100)}%")
+    if hosting_ratio >= 0.8:
+        pts += 2
+        sigs.append("host+")
+
+    # S2 — cluster loads no assets: real browsers fetch CSS/JS/images.
+    asset_ratio = stats.get("assets", 0) / n
+    if asset_ratio < 0.05 and n >= 20:
+        pts += 3
+        sigs.append("noassets")
+
+    # S3 — cluster sends no referers: real users navigate via in-site links.
+    no_ref_ratio = stats.get("no_ref", 0) / n
+    if no_ref_ratio > 0.8 and n >= 10:
+        pts += 2
+        sigs.append("noref")
+
+    # S4 — cluster probes for 4xx: scanner pattern.
+    fourxx_ratio = stats.get("status_4xx", 0) / n
+    if fourxx_ratio > 0.3 and n >= 20:
+        pts += 1
+        sigs.append("4xx")
+
+    # S5 — UA quality: headless / old Chrome / thin or empty UA.
+    ua = stats.get("ua", "")
+    ua_extra = 0
+    ua_flags = []
+    if HEADLESS_UA_RE.search(ua or ""):
+        ua_extra = max(ua_extra, 3); ua_flags.append("headless")
+    if is_old_chrome(ua, chrome_min):
+        ua_extra = max(ua_extra, 2); ua_flags.append("oldchrome")
+    if not ua or ua == "-":
+        ua_extra = max(ua_extra, 2); ua_flags.append("ua_empty")
+    elif len(ua) < 20:
+        ua_extra = max(ua_extra, 2); ua_flags.append("ua_short")
+    if ua_extra > 0:
+        pts += ua_extra
+        sigs.append("ua:" + ",".join(sorted(set(ua_flags))))
+
+    return pts, sigs
+
+
+def scan_log_ua_cluster(cfg, window_start=None):
+    """Parse the access log into per-UA cluster stats.
+
+    Returns dict[ua_str] -> {ips:set, reqs, assets, no_ref, status_4xx}.
+    """
+    stats = defaultdict(lambda: {
+        "ips": set(), "reqs": 0, "assets": 0, "no_ref": 0, "status_4xx": 0,
+    })
+    p = Path(cfg["access_log"])
+    if not p.exists():
+        logging.error("access log not found: %s", p)
+        return stats
+    with p.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            m = LOG_RE.match(line)
+            if not m:
+                continue
+            ip, ts_str, _method, path, _proto, status, referer, ua = m.groups()
+            try:
+                ts = datetime.strptime(ts_str, "%d/%b/%Y:%H:%M:%S %z")
+            except ValueError:
+                continue
+            if window_start is not None and ts < window_start:
+                continue
+            s = stats[(ua or "")[:UA_MAX_LENGTH]]
+            s["ips"].add(ip)
+            s["reqs"] += 1
+            if ASSET_RE.search(path):
+                s["assets"] += 1
+            if referer == "-" or not referer:
+                s["no_ref"] += 1
+            if status.startswith("4"):
+                s["status_4xx"] += 1
+    return stats
+
+
+def find_blockable_ua_clusters(cfg, asn_lookup_fn, window_start=None):
+    """Run the UA-cluster pass. Returns a list of cluster dicts:
+        {ua, score, reasons, ip_count, hosting_ratio, reqs, ips, added, expires}
+
+    A cluster is a User-Agent shared across >= ua_cluster_min_ips distinct IPs.
+    Whitelisted and claimed-bot UAs are skipped (same whitelists as the per-IP
+    pass). The member IPs of a cluster scoring >= ua_cluster_threshold are
+    returned for blocking.
+    """
+    min_ips   = int(cfg.get("ua_cluster_min_ips", 30))
+    threshold = int(cfg.get("ua_cluster_threshold", 7))
+    ttl_days  = int(cfg.get("ua_cluster_ttl_days", 7))
+    self_ips  = set(cfg.get("self_ips", []) or [])
+
+    now = datetime.now(timezone.utc)
+    added_str   = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    expires_str = (now + timedelta(days=ttl_days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    clusters = scan_log_ua_cluster(cfg, window_start)
+    out = []
+    for ua, s in clusters.items():
+        ips = s["ips"] - self_ips
+        if len(ips) < min_ips:
+            continue
+        if is_ua_whitelisted({ua}):
+            continue
+        if is_claimed_bot({ua}):
+            # Claimed bots are held aside, same as the per-IP pass.
+            continue
+        hosting_ratio = hosting_ratio_for_ips(ips, asn_lookup_fn)
+        sc, sigs = score_ua_cluster(
+            {"ua": ua, "reqs": s["reqs"], "assets": s["assets"],
+             "no_ref": s["no_ref"], "status_4xx": s["status_4xx"]},
+            hosting_ratio, cfg,
+        )
+        if sc >= threshold:
+            out.append({
+                "ua":            ua,
+                "score":         sc,
+                "reasons":       ",".join(sigs),
+                "ip_count":      len(ips),
+                "hosting_ratio": hosting_ratio,
+                "reqs":          s["reqs"],
+                "ips":           sorted(ips),
+                "added":         added_str,
+                "expires":       expires_str,
+            })
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -1030,8 +1235,10 @@ def cmd_cleanup(cfg):
     now = datetime.now(timezone.utc)
     any_changed = False
 
-    # Cleanup both block files (subnet + per-IP if enabled)
-    for path_key, label in [("blocked_conf", "subnet"), ("blocked_ips_conf", "per-IP")]:
+    # Cleanup every pass's block file (subnet + per-IP + UA-cluster)
+    for path_key, label in [("blocked_conf", "subnet"),
+                            ("blocked_ips_conf", "per-IP"),
+                            ("blocked_ua_cluster_conf", "ua-cluster")]:
         path = cfg.get(path_key)
         if not path or not Path(path).exists():
             continue
@@ -1152,6 +1359,96 @@ def cmd_per_ip(cfg, dry_run=False, show_only=False):
         logging.error("RELOAD FAILED (per-IP), blocks written but not active")
 
 
+def cmd_ua_cluster(cfg, dry_run=False, show_only=False):
+    """UA-cluster pass (added v1.2).
+
+    Groups requests by User-Agent, scores each cluster of >= ua_cluster_min_ips
+    distinct IPs, and blocks the member IPs of confirmed botnet clusters.
+    Independent from the other passes; writes to `blocked_ua_cluster_conf`.
+    Can be run standalone via --ua-cluster, or auto-runs after the subnet and
+    per-IP passes when ua_cluster_enabled=true.
+    """
+    asn_db = load_asn_db(cfg["asn_db"])
+    if asn_db is None:
+        logging.warning("UA-cluster pass: ASN DB missing, hosting signal disabled")
+
+    def asn_lookup_for(ip_str):
+        if asn_db is None:
+            return ""
+        try:
+            net = ipaddress.ip_network(
+                ip_str + ("/32" if "." in ip_str else "/128"), strict=False)
+        except ValueError:
+            return ""
+        return asn_lookup(net, asn_db) or ""
+
+    # No window_start — like the per-IP pass, scoring works over the full
+    # rotation period of the live access log.
+    clusters = find_blockable_ua_clusters(cfg, asn_lookup_fn=asn_lookup_for,
+                                          window_start=None)
+
+    if show_only:
+        print(f"\nUA-cluster pass: threshold={cfg['ua_cluster_threshold']}, "
+              f"min_ips={cfg['ua_cluster_min_ips']}, clusters flagged={len(clusters)}")
+        print(f"{'SCORE':>5} {'IPS':>6} {'HOST%':>6} {'REQS':>8}  {'REASONS':<28} UA")
+        print("-" * 120)
+        for c in sorted(clusters, key=lambda x: (-x["score"], -x["ip_count"])):
+            print(f"{c['score']:>5} {c['ip_count']:>6} "
+                  f"{int(c['hosting_ratio'] * 100):>5}% {c['reqs']:>8}  "
+                  f"{c['reasons']:<28} {c['ua'][:64]}")
+        if not clusters:
+            print(f"(no UA shared by >= {cfg['ua_cluster_min_ips']} IPs scored "
+                  f">= {cfg['ua_cluster_threshold']})")
+        return
+
+    if not clusters:
+        logging.info("UA-cluster: no clusters above threshold=%d",
+                     cfg["ua_cluster_threshold"])
+        return
+
+    manual, auto = read_blocked(cfg["blocked_ua_cluster_conf"])
+    manual_set = manual_cidrs(manual)
+    auto_by_cidr = {e["cidr"]: e for e in auto}
+
+    added, extended = [], []
+    for c in clusters:
+        ua_tag = re.sub(r"\s+", "_", c["ua"])[:40]
+        full_reason = (f"ua-cluster score{c['score']} {c['ip_count']}ips "
+                       f"host{int(c['hosting_ratio'] * 100)}% {c['reasons']} "
+                       f"ua={ua_tag}")
+        logging.info("UA-CLUSTER score%d %d IPs host%d%% [%s] — UA: %s",
+                     c["score"], c["ip_count"],
+                     int(c["hosting_ratio"] * 100), c["reasons"], c["ua"])
+        for ip in c["ips"]:
+            if ip in manual_set:
+                continue
+            if ip in auto_by_cidr:
+                auto_by_cidr[ip]["expires"] = c["expires"]
+                auto_by_cidr[ip]["reason"] = full_reason
+                extended.append(ip)
+            else:
+                auto.append({"cidr": ip, "added": c["added"],
+                             "expires": c["expires"], "reason": full_reason})
+                added.append(ip)
+
+    logging.info("UA-cluster: %d cluster(s) → %d new IPs, %d extended",
+                 len(clusters), len(added), len(extended))
+
+    if dry_run:
+        logging.info("--dry-run: UA-cluster %d new, %d extended — NOT applied",
+                     len(added), len(extended))
+        return
+    if not added and not extended:
+        return
+
+    write_blocked(cfg["blocked_ua_cluster_conf"], manual, auto)
+    if nginx_reload():
+        logging.info("reloaded (UA-cluster): %d new, %d extended",
+                     len(added), len(extended))
+    else:
+        logging.error("RELOAD FAILED (UA-cluster), blocks written but not active")
+
+
 def setup_logging(log_file):
     fmt = "%(asctime)s %(levelname)s %(message)s"
     Path(log_file).parent.mkdir(parents=True, exist_ok=True)
@@ -1170,7 +1467,12 @@ def main():
                    help="Show top-50 per-IP candidates (path-agnostic pass; diagnostic)")
     p.add_argument("--per-ip", action="store_true",
                    help="Run ONLY the per-IP pass (skip subnet pass)")
-    p.add_argument("--cleanup", action="store_true", help="Remove expired auto-bans (both subnet and per-IP)")
+    p.add_argument("--show-ua-cluster", action="store_true",
+                   help="Show flagged UA-clusters with scores (diagnostic)")
+    p.add_argument("--ua-cluster", action="store_true",
+                   help="Run ONLY the UA-cluster pass (skip subnet pass)")
+    p.add_argument("--cleanup", action="store_true",
+                   help="Remove expired auto-bans (subnet, per-IP and UA-cluster)")
     args = p.parse_args()
 
     cfg = load_config(args.config)
@@ -1184,10 +1486,16 @@ def main():
         cmd_per_ip(cfg, dry_run=True, show_only=True)
     elif args.per_ip:
         cmd_per_ip(cfg, dry_run=args.dry_run)
+    elif args.show_ua_cluster:
+        cmd_ua_cluster(cfg, dry_run=True, show_only=True)
+    elif args.ua_cluster:
+        cmd_ua_cluster(cfg, dry_run=args.dry_run)
     else:
         cmd_run(cfg, dry_run=args.dry_run)
         if cfg.get("per_ip_enabled"):
             cmd_per_ip(cfg, dry_run=args.dry_run)
+        if cfg.get("ua_cluster_enabled"):
+            cmd_ua_cluster(cfg, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

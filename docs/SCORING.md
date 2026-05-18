@@ -1,16 +1,17 @@
 # Scoring details
 
-`nginx-autoblock` ships **two independent scoring passes** with different
+`nginx-autoblock` ships **three independent scoring passes** with different
 target threat classes:
 
 | Pass | Aggregation | Threat class | Default state |
 |------|-------------|--------------|---------------|
 | **Subnet pass** | `/24` (IPv4) / `/64` (IPv6) | Concentrated botnets — same /24 produces 100+ req/h | Enabled |
 | **Per-IP pass** | `/32` per individual IP | Distributed scraping — many IPs, 1-2 req each | Opt-in (`per_ip_enabled=true`, added v1.1) |
+| **UA-cluster pass** | User-Agent string | Distributed botnets — many IPs rotating a tiny UA pool | Opt-in (`ua_cluster_enabled=true`, added v1.2) |
 
 The passes run independently and write to **separate** files
-(`blocked-subnets.conf` and `blocked-ips.conf`). Use whichever combination fits
-your threat profile.
+(`blocked-subnets.conf`, `blocked-ips.conf` and `blocked-ua-clusters.conf`).
+Use whichever combination fits your threat profile.
 
 ---
 
@@ -255,12 +256,104 @@ With claimed-bot whitelist (regex matches "Googlebot"):
 - **`per_ip_chrome_min_version`** drifts over time. Current Chrome major version moves every ~6 weeks. Set to roughly "current minus 6 months" — too aggressive (e.g., current Chrome - 1) catches legitimate users who delayed an update; too lax misses scraper fingerprints.
 - **`internal_ref_hosts`** is important for the noref / extref signals. If empty, all referers are treated as external — making the extref signal fire on legitimate users navigating from your own site.
 
-## How the two passes interact
+---
 
-Both passes run on the same log and may flag the same incident from different angles. Examples:
+# UA-cluster pass (opt-in)
 
-- A botnet hitting 200 IPs in one /24 will be detected by **both** — subnet pass blocks the /24, per-IP pass blocks each IP. Net effect: nginx blocks via /24 (cheaper match). Per-IP entries become redundant — but harmless (they expire on TTL).
-- A distributed scraper using 1 IP per /24 across 200 /24s — only **per-IP** sees it.
-- A high-volume single API client with one UA from one /24 — only **subnet** sees it (the per-IP score on one IP may not reach threshold).
+Both the subnet and per-IP passes score IPs (or subnets) **in isolation**. A
+distributed scraping botnet defeats both by design: hundreds of IPs, ~1
+request each, every IP individually innocent — no `/24` accumulates volume,
+no single `/32` accumulates enough behavioral evidence to reach the per-IP
+threshold.
+
+But such a botnet has one structural weakness: it rotates a **tiny pool of
+User-Agent strings** across its whole IP fleet. One UA shared by 250 hosting
+IPs is not something a real browser produces. That sharing is an **aggregate
+property** — invisible to any per-IP scorer, visible only when you group by UA.
+
+The UA-cluster pass groups requests by User-Agent. For each UA seen from
+`>= ua_cluster_min_ips` distinct IPs (default 30), it scores the *cluster*.
+Score range 0-13; default threshold 7. The member IPs of a cluster scoring at
+or above threshold are written to `blocked-ua-clusters.conf` as `/32` bans.
+
+## Signal table
+
+| # | Signal | Trigger | Points | Why it discriminates |
+|---|--------|---------|--------|----------------------|
+| 1a | **host** | Hosting-ASN ratio ≥ 50% | +2 | A popular real UA spreads across residential ISPs. A botnet fleet sits on datacenter / proxy infrastructure. |
+| 1b | **host+** | Hosting-ASN ratio ≥ 80% | +2 additional | Near-total datacenter concentration — no real browser population looks like this. |
+| 2 | **noassets** | Cluster asset-loading ratio < 5% | +3 | Real browsers fetch CSS/JS/images alongside HTML. Headless scrapers do not. |
+| 3 | **noref** | Cluster no-referer ratio > 80% | +2 | Real users navigate via in-site links (referer present). Bots paste URLs from a list. |
+| 4 | **4xx** | Cluster 4xx-response ratio > 30% | +1 | Scanners probe non-existent paths. |
+| 5 | **ua:headless / oldchrome / short** | UA matches headless tool, old Chrome, or is thin/empty | +3 / +2 / +2 | Self-identifying scraper UAs. Signal 5 takes the max of matched flags. |
+
+**Maximum possible score: 13.**
+
+The discriminator is **hosting-ASN ratio and behavior — never raw IP count**.
+A current Chrome UA shared by 5,000 residential users scores 0: residential
+ASNs, assets loaded, referers present. The same scorer flags a botnet UA
+shared by 250 datacenter IPs at score 9 (host+ +4, noassets +3, noref +2).
+
+Hosting-ASN classification uses the offline `iptoasn.com` ASN DB only — not
+ip-api.com. A cluster can contain hundreds of IPs; ip-api's 45 req/min limit
+makes it unsuitable here, and the local ASN keyword match is enough.
+
+## Calibration example — the May 2026 distributed-scraping incident
+
+```
+A site was knocked over by 997 requests in one minute from 991 distinct IPs
+sharing just 4 User-Agent strings. Per-IP rate limits saw nothing (1 req/IP);
+fail2ban saw nothing (no repeat offenders); the subnet pass saw nothing (IPs
+spread thin across /24s).
+
+UA-cluster pass, one of the four UAs:
+
+  Distinct IPs:  250
+  Requests:      ~3,000
+  Hosting ratio: 90%   (datacenter / residential-proxy ASNs)
+  Asset ratio:   0%
+  No-referer:    97%
+
+Score:
+  host90%        → +2
+  host+          → +2   (≥80%)
+  noassets       → +3
+  noref          → +2
+  ─────────────────────
+  TOTAL          → 9    → BLOCK (all 250 member IPs)
+```
+
+## Whitelisting
+
+The UA-cluster pass reuses the per-IP pass whitelists: a cluster whose UA
+matches the **UA whitelist** (monitoring / CDN fetchers) or the **claimed-bot
+list** (Googlebot, bingbot, etc.) is skipped before scoring. `self_ips` are
+removed from a cluster's IP set before the `ua_cluster_min_ips` gate.
+
+## Tuning UA-cluster
+
+- **`ua_cluster_min_ips`** (default 30) — raise on high-traffic sites where
+  even niche real UAs are shared by 30+ IPs; lower if you expect smaller
+  botnets. This is a gate, not a signal — it only decides which UAs are
+  evaluated, never contributes to the score.
+- **`ua_cluster_threshold`** (default 7) — at 7, a cluster must be both
+  hosting-dominant *and* behaviorally bot-like. Lowering toward 4-5 would let
+  a hosting-only or behavior-only cluster through; raising toward 9 requires
+  almost every signal.
+- **Architectural limit:** this pass is still cron-driven — it detects a
+  botnet after the fact and blocks the IPs it already saw. A rotating botnet
+  brings fresh IPs on its next wave. Catching the cluster *during* the first
+  wave needs realtime delivery — see [ROADMAP.md](../ROADMAP.md) v2.0.
+
+---
+
+# How the three passes interact
+
+All passes run on the same log and may flag the same incident from different angles. Examples:
+
+- A botnet hitting 200 IPs in one /24 is detected by the **subnet** pass (blocks the /24) and the **per-IP** pass (blocks each IP). Net effect: nginx blocks via /24 (cheaper match); per-IP entries are redundant but harmless (they expire on TTL).
+- A distributed scraper using 1 IP per /24 across 200 /24s — only **per-IP** sees it, and only if each IP accumulates enough behavioral evidence.
+- A distributed botnet of 250 IPs each making 1 request, all sharing one UA — only the **UA-cluster** pass sees it: no /24 has volume, no /32 has evidence, but the shared UA is unmistakable.
+- A high-volume single API client with one UA from one /24 — only **subnet** sees it.
 
 Both files are included in the same `geo $blocked_subnet` block. nginx checks both — either match returns the block decision.

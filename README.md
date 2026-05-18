@@ -1,10 +1,11 @@
 # nginx-autoblock
 
-Behavioral autoblocker for Nginx. Detects bot crawlers by **composite scoring** across multiple signals (UA diversity, request patterns, IP reputation, behavioral fingerprint) and adds offending **subnets and individual IPs** to nginx's block-list with TTL.
+Behavioral autoblocker for Nginx. Detects bot crawlers by **composite scoring** across multiple signals (UA diversity, request patterns, IP reputation, behavioral fingerprint) and adds offending **subnets, individual IPs and UA-clusters** to nginx's block-list with TTL.
 
-Designed for two threat classes that per-IP rate-limiting (`limit_req_zone $binary_remote_addr`) misses:
+Designed for three threat classes that per-IP rate-limiting (`limit_req_zone $binary_remote_addr`) misses:
 - **Concentrated botnets** — same /24 producing 100+ req/h, each IP individually below per-IP limits (subnet pass, default).
-- **Distributed scraping** — hundreds of cloud IPs from many ASNs, 1-2 requests each, mass-scraping public URLs harvested from sitemaps or tournament/product pages (per-IP pass, opt-in since v1.1).
+- **Distributed scraping** — hundreds of cloud IPs from many ASNs, 1-2 requests each, mass-scraping public URLs harvested from sitemaps or catalog/product pages (per-IP pass, opt-in since v1.1).
+- **Distributed botnets** — hundreds of IPs making ~1 request each while rotating a tiny pool of User-Agent strings; no IP and no /24 stands out, but the shared UA does (UA-cluster pass, opt-in since v1.2).
 
 ```
                 ┌─────────────────────────────────────────────────┐
@@ -20,11 +21,17 @@ Designed for two threat classes that per-IP rate-limiting (`limit_req_zone $bina
                 │     score each IP 0-14 (path-agnostic)          │
                 │     catches distributed scrapers (1 req/IP)     │
                 │     block /32 if score ≥ 9                      │
+                │                                                 │
+                │   UA-cluster pass (opt-in since v1.2):          │
+                │     group by User-Agent, score the cluster      │
+                │     catches distributed botnets (shared UA)     │
+                │     block member /32s if score ≥ 7              │
                 └────────────────┬────────────────────────────────┘
                                  │
                                  ▼
-                 /etc/nginx/blocked-subnets.conf   (subnet pass)
-                 /etc/nginx/blocked-ips.conf       (per-IP pass)
+            /etc/nginx/blocked-subnets.conf      (subnet pass)
+            /etc/nginx/blocked-ips.conf          (per-IP pass)
+            /etc/nginx/blocked-ua-clusters.conf  (UA-cluster pass)
                                  │
                                  ▼
                        nginx returns 444 to bot
@@ -113,6 +120,50 @@ Enable the per-IP pass when you observe **either**:
 
 Backtest details and signal calibration: [docs/SCORING.md § Per-IP pass](docs/SCORING.md#per-ip-pass-opt-in).
 Real-world first-hour results from a Laravel-fronted reference site: [docs/CASE-STUDY.md](docs/CASE-STUDY.md).
+
+## UA-cluster scoring (distributed botnets)
+
+Both the subnet and per-IP passes score IPs **in isolation**. A distributed
+botnet defeats both by design — hundreds of IPs, ~1 request each, every IP
+individually innocent. But the botnet rotates a **tiny pool of User-Agent
+strings** across its whole fleet. One UA shared by 250 datacenter IPs is not
+something a real browser population produces. Since **v1.2**, an opt-in third
+pass groups requests by User-Agent and scores the cluster.
+
+```ini
+# /etc/nginx-autoblock/config.env
+ua_cluster_enabled=true
+ua_cluster_min_ips=30      # min distinct IPs sharing a UA to evaluate it
+ua_cluster_threshold=7
+```
+
+Run it after the regular cron passes, or directly:
+
+```bash
+sudo autoblock --show-ua-cluster      # diagnostic — flagged clusters, read-only
+sudo autoblock --ua-cluster --dry-run # what would be blocked
+sudo autoblock --ua-cluster           # actually block
+```
+
+Output goes to `/etc/nginx/blocked-ua-clusters.conf` — a confirmed botnet
+cluster contributes all its member IPs as `/32` bans.
+
+### Signal set
+
+| Signal | Trigger | Points |
+|--------|---------|--------|
+| **host** / **host+** | Cluster hosting-ASN ratio ≥ 50% / ≥ 80% | +2 / +2 additional |
+| **noassets** | Cluster asset-loading ratio < 5% | +3 |
+| **noref** | Cluster no-referer ratio > 80% | +2 |
+| **4xx** | Cluster 4xx-response ratio > 30% | +1 |
+| **ua:headless / oldchrome / short** | UA is a headless tool, old Chrome, or thin | +3 / +2 / +2 |
+
+**Maximum score: 13.** Default threshold: 7. The discriminator is **hosting-ASN
+ratio and behavior — never raw IP count**: a current Chrome UA shared by
+thousands of residential users scores 0, while a botnet UA shared by 250
+datacenter IPs scores 9. Whitelisted and claimed search-engine UAs skip scoring.
+
+Signal calibration and the May 2026 reference incident: [docs/SCORING.md § UA-cluster pass](docs/SCORING.md#ua-cluster-pass-opt-in).
 
 ## Quick install
 
