@@ -5,6 +5,46 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added — UA-cluster scoring pass (path-agnostic)
+
+An optional third pass that groups requests by **User-Agent** and scores the
+cluster — the set of distinct IPs sharing one UA.
+
+The motivation: the subnet pass scores `/24`s and the per-IP pass scores
+`/32`s; both score IPs in isolation. A distributed scraping botnet defeats
+both by design — hundreds of IPs, ~1 request each, every IP individually
+innocent. But such a botnet rotates a tiny pool of User-Agent strings across
+its whole fleet. That sharing is an **aggregate property** invisible to any
+per-IP scorer.
+
+The UA-cluster pass detects it: for each UA seen from `>= ua_cluster_min_ips`
+distinct IPs, it scores the cluster on hosting-ASN ratio, cluster-wide
+behavioral homogeneity (no assets, no referers, 4xx probing) and UA quality.
+The member IPs of a cluster scoring `>= ua_cluster_threshold` are blocked.
+
+A genuinely popular real-browser UA is also shared by many IPs — but those IPs
+are residential and behave normally, so the cluster scores low. ASN type and
+behavior are the discriminators, not raw IP count.
+
+- New CLI flags:
+  - `--ua-cluster` — run only the UA-cluster pass
+  - `--show-ua-cluster` — diagnostic list of flagged clusters (read-only)
+- New output file: `blocked-ua-clusters.conf` (separate from the other passes)
+- New config keys: `ua_cluster_enabled`, `blocked_ua_cluster_conf`,
+  `ua_cluster_min_ips`, `ua_cluster_threshold`, `ua_cluster_ttl_days`
+- `--cleanup` now also expires UA-cluster bans
+- `nginx/blacklist.conf` now includes all three block files in the geo block
+- Added `ROADMAP.md`
+
+### Backward compatibility
+
+Fully backward compatible. The pass is disabled unless `ua_cluster_enabled=true`
+is set; with it unset, behaviour is identical to v1.1.0. The new
+`blocked-ua-clusters.conf` include is safe even when the file does not exist
+(nginx logs a warning at reload but continues).
+
 ## [v1.1.0] - 2026-05-15
 
 ### Added — Per-IP behavioral scoring (path-agnostic)
