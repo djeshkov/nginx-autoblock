@@ -133,8 +133,9 @@ pass groups requests by User-Agent and scores the cluster.
 ```ini
 # /etc/nginx-autoblock/config.env
 ua_cluster_enabled=true
-ua_cluster_min_ips=30      # min distinct IPs sharing a UA to evaluate it
+ua_cluster_min_ips=30       # min distinct IPs sharing a UA to evaluate it
 ua_cluster_threshold=7
+ua_cluster_min_hosting=0.5  # hosting-ratio gate (see note below)
 ```
 
 Run it after the regular cron passes, or directly:
@@ -163,7 +164,13 @@ ratio and behavior — never raw IP count**: a current Chrome UA shared by
 thousands of residential users scores 0, while a botnet UA shared by 250
 datacenter IPs scores 9. Whitelisted and claimed search-engine UAs skip scoring.
 
-Signal calibration and the May 2026 reference incident: [docs/SCORING.md § UA-cluster pass](docs/SCORING.md#ua-cluster-pass-opt-in).
+**Hosting-ratio gate** (`ua_cluster_min_hosting`, default 0.5): a cluster whose
+IPs are less than that fraction on hosting/datacenter ASNs is never blocked,
+regardless of score. Behind a CDN, static assets are edge-cached so the
+`noassets` signal fires on real-user clusters too — the gate makes hosting-ASN
+ratio a necessary condition. Set to 0 only on origins not behind a CDN.
+
+Signal calibration, the hosting-ratio gate, and the May 2026 reference incident: [docs/SCORING.md § UA-cluster pass](docs/SCORING.md#ua-cluster-pass-opt-in).
 
 ## Quick install
 

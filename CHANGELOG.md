@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [v1.2.1] - 2026-05-18
+
+### Fixed — UA-cluster hosting-ratio gate (false positives behind a CDN)
+
+The v1.2.0 UA-cluster pass could flag a residential cluster — i.e. real
+users — when the origin sits behind a CDN.
+
+Root cause: the `noassets` signal (+3) assumes real browsers fetch CSS / JS /
+images alongside HTML. Behind a CDN those assets are served from the edge
+cache — the origin sees ~0% asset ratio for **everyone**, bots and real users
+alike. `docs/SCORING.md` already documents this for the subnet pass
+("Static-asset ratio is NOT a signal ... behind a CDN ... provides no
+discrimination"); v1.2.0 did not carry that reasoning into the UA-cluster
+pass. As a result a cluster of real users on an old browser version could
+reach the block threshold on `noassets` + `noref` + `ua:oldchrome` alone,
+with no hosting-ASN signal at all.
+
+Fix: a **hosting-ratio gate**. A cluster whose member IPs are less than
+`ua_cluster_min_hosting` (default `0.5`) on hosting/datacenter ASNs is never
+blocked, regardless of behavioral score. Hosting-ASN ratio is the
+discriminator that survives a CDN. Set `ua_cluster_min_hosting=0` to disable
+the gate on origins that are NOT behind a CDN, where the behavioral signals
+are valid on their own.
+
+- New config key: `ua_cluster_min_hosting` (default `0.5`)
+- 3 new tests covering the gate
+- docs: SCORING.md, config.example.env updated with the gate rationale
+
 ## [v1.2.0] - 2026-05-18
 
 ### Added — UA-cluster scoring pass (path-agnostic)
