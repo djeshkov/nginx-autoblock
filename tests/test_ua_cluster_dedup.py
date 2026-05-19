@@ -95,6 +95,39 @@ def test_ua_cluster_no_per_ip_file_is_safe(autoblock_mod, tmp_path, monkeypatch)
     assert cidrs == {"4.4.4.4", "5.5.5.5"}
 
 
+def test_ua_cluster_collapses_preexisting_internal_duplicates(autoblock_mod, tmp_path, monkeypatch):
+    """A block file written by an older version may list the same CIDR twice
+    (the auto_by_cidr index was not kept in sync). The pass must collapse such
+    in-file duplicates to a single entry on the next write — self-healing."""
+    ua_file = tmp_path / "blocked-ua-clusters.conf"
+    ips_file = tmp_path / "no-per-ip.conf"
+
+    # 6.6.6.6 listed TWICE — a pre-existing in-file duplicate
+    ua_file.write_text(textwrap.dedent(f"""\
+        {autoblock_mod.AUTO_BEGIN_MARKER}
+        6.6.6.6 1; # auto added=2026-05-18T00:00:00Z expires=2026-05-25T00:00:00Z reason=ua-cluster
+        6.6.6.6 1; # auto added=2026-05-18T00:00:00Z expires=2026-05-25T00:00:00Z reason=ua-cluster
+        8.8.8.8 1; # auto added=2026-05-18T00:00:00Z expires=2026-05-25T00:00:00Z reason=ua-cluster
+        {autoblock_mod.AUTO_END_MARKER}
+        """))
+
+    monkeypatch.setattr(autoblock_mod, "find_blockable_ua_clusters",
+                        lambda *a, **k: [{
+                            "ua": "UA-X", "score": 10, "ip_count": 50,
+                            "hosting_ratio": 0.9, "reasons": "x", "ips": ["8.8.8.8"],
+                            "added": "2026-05-19T10:00:00Z",
+                            "expires": "2026-05-26T10:00:00Z"}])
+    monkeypatch.setattr(autoblock_mod, "nginx_reload", lambda: True)
+
+    cfg = _make_cfg(tmp_path, ua_file, ips_file)
+    autoblock_mod.cmd_ua_cluster(cfg, dry_run=False)
+
+    _, auto = autoblock_mod.read_blocked(str(ua_file))
+    cidrs = [e["cidr"] for e in auto]
+    assert cidrs.count("6.6.6.6") == 1, "pre-existing in-file duplicate must collapse"
+    assert cidrs.count("8.8.8.8") == 1
+
+
 def test_ua_cluster_same_ip_two_clusters_not_duplicated(autoblock_mod, tmp_path, monkeypatch):
     """An IP appearing in two clusters in one run must be written once, not
     twice (the auto_by_cidr index must be updated as entries are appended)."""

@@ -1441,10 +1441,21 @@ def cmd_ua_cluster(cfg, dry_run=False, show_only=False):
         pm, pa = read_blocked(per_ip_path)
         per_ip_cidrs = manual_cidrs(pm) | {e["cidr"] for e in pa}
 
+    # One pass cleans two duplicate classes:
+    #   - cross-file: entries the per-IP pass now owns (skip them here)
+    #   - in-file:    the same CIDR listed twice (collapse to one, last wins)
+    # In-file duplicates can exist in block files written by versions before
+    # the auto_by_cidr index was kept in sync; this self-heals them on the
+    # next write.
     pre_dedup = len(auto)
-    auto = [e for e in auto if e["cidr"] not in per_ip_cidrs]
+    deduped = {}
+    for e in auto:
+        if e["cidr"] in per_ip_cidrs:
+            continue
+        deduped[e["cidr"]] = e
+    auto = list(deduped.values())
     dropped_dups = pre_dedup - len(auto)
-    auto_by_cidr = {e["cidr"]: e for e in auto}
+    auto_by_cidr = deduped
 
     added, extended, skipped_per_ip = [], [], 0
     for c in clusters:
