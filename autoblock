@@ -1427,9 +1427,26 @@ def cmd_ua_cluster(cfg, dry_run=False, show_only=False):
 
     manual, auto = read_blocked(cfg["blocked_ua_cluster_conf"])
     manual_set = manual_cidrs(manual)
+
+    # Dedup against the per-IP pass output. An IP already blocked by the per-IP
+    # pass must NOT also be written here: both files are included in the same
+    # nginx geo block, and a CIDR present in two included files makes nginx log
+    # a "duplicate network" warning on every reload. The per-IP pass owns such
+    # IPs (it runs first); the UA-cluster pass yields. We both skip them when
+    # adding AND drop any stale entries already in our file that the per-IP
+    # pass now owns — that cleans duplicates accumulated before this fix.
+    per_ip_cidrs = set()
+    per_ip_path = cfg.get("blocked_ips_conf")
+    if per_ip_path and Path(per_ip_path).exists():
+        pm, pa = read_blocked(per_ip_path)
+        per_ip_cidrs = manual_cidrs(pm) | {e["cidr"] for e in pa}
+
+    pre_dedup = len(auto)
+    auto = [e for e in auto if e["cidr"] not in per_ip_cidrs]
+    dropped_dups = pre_dedup - len(auto)
     auto_by_cidr = {e["cidr"]: e for e in auto}
 
-    added, extended = [], []
+    added, extended, skipped_per_ip = [], [], 0
     for c in clusters:
         ua_tag = re.sub(r"\s+", "_", c["ua"])[:40]
         full_reason = (f"ua-cluster score{c['score']} {c['ip_count']}ips "
@@ -1441,6 +1458,9 @@ def cmd_ua_cluster(cfg, dry_run=False, show_only=False):
         for ip in c["ips"]:
             if ip in manual_set:
                 continue
+            if ip in per_ip_cidrs:
+                skipped_per_ip += 1
+                continue
             if ip in auto_by_cidr:
                 auto_by_cidr[ip]["expires"] = c["expires"]
                 auto_by_cidr[ip]["reason"] = full_reason
@@ -1448,16 +1468,19 @@ def cmd_ua_cluster(cfg, dry_run=False, show_only=False):
             else:
                 auto.append({"cidr": ip, "added": c["added"],
                              "expires": c["expires"], "reason": full_reason})
+                auto_by_cidr[ip] = auto[-1]
                 added.append(ip)
 
-    logging.info("UA-cluster: %d cluster(s) → %d new IPs, %d extended",
-                 len(clusters), len(added), len(extended))
+    logging.info("UA-cluster: %d cluster(s) → %d new IPs, %d extended, "
+                 "%d skipped (owned by per-IP pass), %d stale dups dropped",
+                 len(clusters), len(added), len(extended),
+                 skipped_per_ip, dropped_dups)
 
     if dry_run:
         logging.info("--dry-run: UA-cluster %d new, %d extended — NOT applied",
                      len(added), len(extended))
         return
-    if not added and not extended:
+    if not added and not extended and not dropped_dups:
         return
 
     write_blocked(cfg["blocked_ua_cluster_conf"], manual, auto)
